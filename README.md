@@ -90,7 +90,7 @@ pyinstaller build/HermesCacheMonitor.spec --distpath dist --workpath build/work 
 生成的单文件可执行程序将位于 `dist/HermesCacheMonitor.exe`。
 
 ---
-
+## ⭐本项目由api.dshapi.icu站赞助。满血国模0.092x，gpt不降智0.22x。有开源项目就赞助token
 ## 📄 开源协议
 
 本项目采用 [MIT License](LICENSE) 协议开源。
