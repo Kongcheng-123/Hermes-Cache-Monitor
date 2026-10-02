@@ -2288,18 +2288,18 @@ class Monitor:
 
     @staticmethod
     def _is_hermes_focused():
-        """检查前台焦点是否在 Hermes（未聚焦时休眠以降低 UIA 跨进程开销）。"""
+        """检查前台焦点是否在 Hermes（包含主程序与 WebView2 渲染进程）。"""
         try:
             import ctypes
             hwnd = ctypes.windll.user32.GetForegroundWindow()
             if not hwnd:
-                return False
+                return True
             pid = ctypes.c_ulong()
             ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
             import psutil
             p = psutil.Process(pid.value)
             name = (p.name() or "").lower()
-            return ("hermes" in name or "electron" in name or "python" in name)
+            return ("hermes" in name or "webview" in name or "msedge" in name or "electron" in name or "python" in name)
         except Exception:
             return True
 
@@ -2369,7 +2369,8 @@ class Monitor:
         with self._sid_lock:
             self._chg_times = []
             self._lock_until = 0.0
-        # 只重置「重扫许可」，不动 _uia_btn（热读路径 0.1ms，见上面说明）
+        # 手动刷新时清空 _uia_btn，强制重新全树探测当前活动会话
+        self._uia_btn = None
         self._uia_last_try = 0.0
         self._hist_last_try = 0.0
         self.hist_mtime = 0
