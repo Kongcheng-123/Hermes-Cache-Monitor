@@ -1,0 +1,20 @@
+[
+  {
+    "name": "示例站点-NewAPI类",
+    "base_url": "https://api.your-newapi-site.com/v1",
+    "hermes_providers": [
+      "custom:your-provider-name"
+    ],
+    "enabled": true,
+    "note": "大部分第三方中转站均为 NewAPI，填入 base_url 和你在 Hermes 中配置的 provider 名称即可自动识别"
+  },
+  {
+    "name": "示例站点-sub2api类",
+    "base_url": "https://api.your-sub2api-site.com/v1",
+    "hermes_providers": [
+      "custom:your-sub2api-provider"
+    ],
+    "enabled": false,
+    "note": "使用 sub2api 架构的中转站，支持直读日度统计或通过 dsh_auth.py 桥接导入网页登录态"
+  }
+]

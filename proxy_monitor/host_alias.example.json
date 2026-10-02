@@ -1,0 +1,7 @@
+{
+  "description": "站点别名归一配置（当同一中转站拥有多个镜像域名时使用）",
+  "map": {
+    "api2.example.com": "api.example.com",
+    "api3.example.com": "api.example.com"
+  }
+}

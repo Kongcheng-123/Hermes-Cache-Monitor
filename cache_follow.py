@@ -1,0 +1,5757 @@
+# -*- coding: utf-8 -*-
+"""cache_follow.py v4 — 跟随式缓存监控悬浮窗（价格 + 缺账检测版）
+
+跟随 Hermes 桌面端"当前打开的对话"：
+- 主信号: UIA「复制会话 ID」按钮（实时，热路径 <1ms）
+- 兜底:   WebView2 History 最新 #/tasks/<sid> → state.db 最近活动
+
+v4 新增：
+- 价格/成本：cache_prices.json（站×模型匹配）＋ 峰谷价 ＋ 子代理汇总
+- 缺账检测：agent.log 真实请求数 vs 记账调用数 → 覆盖率、缺账估算（可点击计入成本）
+- 缺账明细弹窗、价格填写弹窗、价格表管理窗口
+
+用法:
+  python "D:\\Hermes works\\cache_follow.py"         # 悬浮窗模式
+  python "D:\\Hermes works\\cache_follow.py" --once  # 打印一次当前结果（调试）
+  python "D:\\Hermes works\\cache_follow.py" --sid <会话ID>        # 指定会话
+  python "D:\\Hermes works\\cache_follow.py" --stats all           # 文本打印成本统计（24h/today/7d/30d/all）
+  python "D:\\Hermes works\\cache_follow.py" --segments            # 打印价格表的价格段（时间轴）
+  python "D:\\Hermes works\\cache_follow.py" --recompute day       # 按「当天生效的价格段」逐日重算（day/missing/all）
+  python "D:\\Hermes works\\cache_follow.py" --bill-file bills.json  # 导入实付锚点（单对象或数组）
+  python "D:\\Hermes works\\cache_follow.py" --bills --resolve     # 列出锚点并反推倍率/真单价
+  python "D:\\Hermes works\\cache_follow.py" --bill-del "host|model|from|to"
+"""
+import collections
+import json
+import os
+import re
+import shutil
+import sqlite3
+import sys
+import tempfile
+import threading
+import time
+import tkinter as tk
+from datetime import datetime
+from tkinter import filedialog, messagebox, ttk
+from urllib.parse import quote, urlparse
+
+try:
+    import uiautomation as _uia
+except Exception:
+    _uia = None
+
+try:
+    from icon_data import ICON_B64 as _ICON_B64
+except Exception:
+    _ICON_B64 = ""
+
+_ICON_CACHE = []
+
+# ── 诊断/调试开关（也可用环境变量）──
+#   --no-uia   禁用 UIA 实时跟随（只走 WebView2/SMU）→ 用来二分定位"卡顿是否来自 UIA"
+#   --profile  把 tick 里耗时 >30ms 的环节写进数据目录的 tick_profile.log
+_NO_UIA = ("--no-uia" in sys.argv) or (os.environ.get("HERMES_MON_NO_UIA") == "1")
+_PROFILE = ("--profile" in sys.argv) or (os.environ.get("HERMES_MON_PROFILE") == "1")
+
+
+def _startup_log(msg):
+    """启动诊断日志（排查用）：写到数据目录下的 startup.log。"""
+    try:
+        base = WORK_DIR or _appdata_dir()
+        with open(os.path.join(base, "startup.log"), "a", encoding="utf-8") as f:
+            f.write("%s  %s\n" % (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), msg))
+    except Exception:
+        pass
+
+
+def apply_icon(win):
+    """给 tkinter 窗口设置图标（内嵌 base64 PNG，无需外部文件）。"""
+    if not _ICON_B64:
+        _startup_log("icon: 内嵌数据为空（icon_data 模块缺失）")
+        return
+    try:
+        img = tk.PhotoImage(data=_ICON_B64)
+        win.iconphoto(True, img)
+        _ICON_CACHE.append(img)      # 保持引用，防止图标被 GC
+        _startup_log("icon: 已应用 %dx%d（base64 %d 字符）" % (img.width(), img.height(), len(_ICON_B64)))
+    except Exception as ex:
+        _startup_log("icon: 应用失败 %s" % ex)
+
+
+def apply_dark_title_bar(win, bg_hex="#1e1e24"):
+    """为 Windows 窗口启用沉浸式深色标题栏，并将标题栏底色设置为与 UI 背景完全融为一体。"""
+    try:
+        import ctypes
+        from ctypes import c_int, byref
+        win.update_idletasks()
+        hwnd = ctypes.windll.user32.GetParent(win.winfo_id())
+        if not hwnd:
+            hwnd = win.winfo_id()
+        # 1. 沉浸式暗黑模式（Win11/Win10 20H1+ 属性为 20，老版 1809 为 19）
+        val = c_int(1)
+        res = ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, 20, byref(val), ctypes.sizeof(val))
+        if res != 0:
+            ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, 19, byref(val), ctypes.sizeof(val))
+        # 2. Windows 11 (22000+) 设置标题栏背景色与文字颜色
+        if bg_hex and bg_hex.startswith("#") and len(bg_hex) == 7:
+            r = int(bg_hex[1:3], 16)
+            g = int(bg_hex[3:5], 16)
+            b = int(bg_hex[5:7], 16)
+            color_ref = c_int(r | (g << 8) | (b << 16))
+            ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, 35, byref(color_ref), ctypes.sizeof(color_ref))
+            text_ref = c_int(0xe0 | (0xe0 << 8) | (0xe0 << 16))
+            ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, 36, byref(text_ref), ctypes.sizeof(text_ref))
+    except Exception as e:
+        _startup_log("暗黑标题栏应用失败：%s" % e)
+
+
+APP_NAME = "HermesCacheMonitor"
+
+# 数据目录分裂检测结果（由 _appdata_dir() 填充）：非空 = 发现 MSIX 虚拟化影子目录
+_DATA_SPLIT = ""
+
+# 路径全部由 init_paths() 在运行期解析（支持任意 CN 桌面版安装位置 / exe 分发）
+HERMES_HOME = ""
+DB = ""
+UI_DB = ""
+LOGS_DIR = ""
+HISTORY = ""
+WORK_DIR = ""
+PRICES_PATH = ""
+LEDGER_PATH = ""
+SAMPLES_PATH = ""
+CONFIG_PATH = ""
+REFRESH_MS = 1000
+SITE_INFO_TTL = 5.0          # state.db 会话信息缓存秒数
+
+
+# ─────────────────────── 路径解析（可移植） ───────────────────────
+
+def _appdata_dir():
+    """配置/数据目录：优先 %APPDATA%\\HermesCacheMonitor，不可写则退到程序旁。
+
+    ⚠ MSIX 文件虚拟化（2026-09-16 实测澄清）：
+      * 打包后的 exe（PyInstaller）非 MSIX 包 → 不虚拟化，写真实 %APPDATA%
+      * Store 版 python（WindowsApps\\python.exe）→ 会被重定向到
+        %LOCALAPPDATA%\\Packages\\PythonSoftwareFoundation.Python.3.x_<hash>\\LocalCache\\Roaming\\
+      * 官方 python（py 启动器）→ 也写真实 %APPDATA%
+    所以混用 `python` 和 `py` 跑命令行会出现「两份数据」。这里做一次自检并记日志，
+    并把结果放在 _DATA_SPLIT 里供 UI 提示。
+    """
+    global _DATA_SPLIT
+    base = os.environ.get("APPDATA") or os.path.expanduser("~")
+    d = os.path.join(base, APP_NAME)
+    try:
+        os.makedirs(d, exist_ok=True)
+    except Exception:
+        try:
+            return os.path.dirname(os.path.abspath(sys.argv[0] or "."))
+        except Exception:
+            return os.getcwd()
+    _DATA_SPLIT = _check_data_split(d)
+    return d
+
+
+def _check_data_split(real_dir):
+    """检查是否存在「正在被写入的」MSIX 虚拟化影子目录。
+
+    ⚠ 判据是**影子目录比正式目录更新**，而不是「影子目录存在」——
+    只要用过一次 Store 版 python 就会留下历史残留目录，若按「存在即报警」，
+    这具尸体躺在那儿会让警告永远消不掉（2026-09-16 踩过这个坑）。
+
+    返回影子目录路径；没有「更新的」影子则返回 ""。
+    """
+    try:
+        pk = os.path.join(os.environ.get("LOCALAPPDATA") or "", "Packages")
+        if not os.path.isdir(pk):
+            return ""
+        try:
+            real_m = max(os.path.getmtime(os.path.join(real_dir, f))
+                         for f in os.listdir(real_dir))
+        except Exception:
+            real_m = 0.0
+        stale = ""
+        for name in os.listdir(pk):
+            if "PythonSoftwareFoundation" not in name:
+                continue
+            cand = os.path.join(pk, name, "LocalCache", "Roaming", APP_NAME)
+            if not os.path.isdir(cand):
+                continue
+            files = [f for f in ("cost_ledger.json", "cache_prices.json", "calib_samples.json")
+                     if os.path.isfile(os.path.join(cand, f))]
+            if not files:
+                continue
+            try:
+                cand_m = max(os.path.getmtime(os.path.join(cand, f)) for f in files)
+            except Exception:
+                continue
+            # 影子比正式新 → 有进程正往那边写，才算真分裂
+            if cand_m > real_m:
+                return cand
+            stale = cand
+        if stale:
+            _startup_log("数据自检: 发现历史残留影子目录（未更新，仅提示不报警）: %s" % stale)
+        return ""
+    except Exception:
+        return ""
+
+
+def _valid_home(p):
+    return bool(p) and os.path.isfile(os.path.join(p, "state.db"))
+
+
+def scan_hermes_homes():
+    """扫描候选 hermes-home 目录（含 state.db 的才算）。"""
+    cands = []
+    env = os.environ.get("HERMES_HOME")
+    if env:
+        cands.append(env)
+    roots = []
+    for name in ("LOCALAPPDATA", "APPDATA", "ProgramData"):
+        b = os.environ.get(name)
+        if b:
+            roots += [os.path.join(b, "Hermes Agent CN Desktop"), os.path.join(b, "Hermes")]
+    roots += [r"D:\Hermes Agent CN Desktop", r"D:\Hermes",
+              r"C:\Hermes Agent CN Desktop", r"C:\Hermes"]
+    # 各盘根目录里的 *Hermes* 目录（浅层）
+    for drive in ("C", "D", "E", "F", "G"):
+        root = drive + ":\\"
+        if not os.path.isdir(root):
+            continue
+        try:
+            for name in os.listdir(root):
+                p = os.path.join(root, name)
+                if os.path.isdir(p) and "hermes" in name.lower():
+                    roots.append(p)
+        except Exception:
+            pass
+    for r in roots:
+        if r:
+            cands.append(os.path.join(r, "data", "hermes-home"))
+            cands.append(r)
+    # 最后手段：从运行中的 Hermes 进程命令行里捞路径
+    try:
+        import subprocess
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -match 'hermes-home' } "
+             "| Select-Object -First 3 -ExpandProperty CommandLine"],
+            capture_output=True, timeout=6)      # ⚠ 不要 text=True：默认按 utf-8 解码，
+        raw = out.stdout or b""                  # 中文 Windows 的 PowerShell 输出是 GBK →
+        txt = ""                                 # 每次都会抛 UnicodeDecodeError 打在屏幕上
+        for enc in ("utf-8", "gbk"):
+            try:
+                txt = raw.decode(enc)
+                break
+            except UnicodeDecodeError:
+                continue
+        else:
+            txt = raw.decode("utf-8", "replace")
+        for m in re.finditer(r"([A-Za-z]:\\[^\"'<>|]*?hermes-home)", txt):
+            cands.append(m.group(1).rstrip("\\"))
+    except Exception:
+        pass
+    out = []
+    for c in cands:
+        if c and c not in out and _valid_home(c):
+            out.append(c)
+
+    # ⚠ 排序（2026-09-22 修）：原来按「发现顺序」返回第一个，而候选里
+    # 先排 %LOCALAPPDATA% 下的目录、再排硬编码的 D:\... —— 只要有一个残留/空壳
+    # hermes-home（例如官方版留下的小库）就会盖过真正在用的库，导致悬浮窗读错库、
+    # 连「切档位 / 注入提示」都会改到那份废弃 config 上（实测踩过）。
+    # 用 state.db 文件大小排序即可判别：真实在用库 899MB vs 残留空壳 0.3MB（差 3000 倍），
+    # 且 getsize 不用开库（不会踩锁）。
+    def _weight(p):
+        try:
+            return os.path.getsize(os.path.join(p, "state.db"))
+        except OSError:
+            return 0
+
+    out.sort(key=_weight, reverse=True)
+    if len(out) > 1:
+        _startup_log("探测到 %d 个 hermes-home，按库大小选：%s（其余：%s）" % (
+            len(out), out[0], "; ".join(out[1:4])))
+    return out
+
+
+def load_config():
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8-sig") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_config(cfg):
+    try:
+        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=1)
+    except Exception:
+        pass
+
+
+def _ensure_output():
+    """windowed（无控制台）exe 下 sys.stdout 是 None，print 会失效。
+
+    这里把输出重定向到数据目录的 cli_output.log，保证用 exe 跑
+    --stats / --bills / --segments 等命令行模式也能看到结果。
+    返回日志路径（无需重定向时返回 None）。
+    """
+    need = False
+    for name in ("stdout", "stderr"):
+        s = getattr(sys, name, None)
+        if s is None:
+            need = True
+            break
+        try:
+            s.write("")
+        except Exception:
+            need = True
+            break
+    if not need:
+        return None
+    try:
+        path = os.path.join(WORK_DIR, "cli_output.log")
+        f = open(path, "a", encoding="utf-8")
+        f.write("\n===== %s  %s =====\n" % (
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"), " ".join(sys.argv[1:])))
+        f.flush()
+        if getattr(sys, "stdout", None) is None:
+            sys.stdout = f
+        if getattr(sys, "stderr", None) is None:
+            sys.stderr = f
+        return path
+    except Exception:
+        try:                       # 兜底：至少别让 print 崩
+            if getattr(sys, "stdout", None) is None:
+                sys.stdout = open(os.devnull, "w", encoding="utf-8")
+            if getattr(sys, "stderr", None) is None:
+                sys.stderr = sys.stdout
+        except Exception:
+            pass
+        return None
+
+
+def init_paths(cfg=None):
+    """解析全部路径并填充全局量。返回 (ok, message)。"""
+    global HERMES_HOME, DB, UI_DB, LOGS_DIR, HISTORY, WORK_DIR
+    global PRICES_PATH, LEDGER_PATH, SAMPLES_PATH, CONFIG_PATH
+    global CALIB_PATH, SITE_MERGE_PATH
+    CONFIG_PATH = os.path.join(_appdata_dir(), "config.json")
+    cfg = cfg if cfg is not None else load_config()
+
+    hh = cfg.get("hermes_home") or ""
+    if not _valid_home(hh):
+        found = scan_hermes_homes()
+        hh = found[0] if found else ""
+    HERMES_HOME = hh
+    DB = os.path.join(hh, "state.db") if hh else ""
+    UI_DB = os.path.join(hh, "desktop-ui.sqlite") if hh else ""
+    LOGS_DIR = os.path.join(hh, "logs") if hh else ""
+
+    # WebView2 History（兜底信号，找不到就停用该信号）
+    hist = cfg.get("webview2_history") or ""
+    if not (hist and os.path.isfile(hist)):
+        hist = ""
+        envv = os.environ.get("WEBVIEW2_USER_DATA_FOLDER")
+        if envv:
+            c = os.path.join(envv, "EBWebView", "Default", "History")
+            if os.path.isfile(c):
+                hist = c
+        if not hist and hh:
+            # hermes-home 通常是 <root>\data\hermes-home，webview2 在 <root>\data\webview2
+            for root in (os.path.dirname(hh), os.path.dirname(os.path.dirname(hh))):
+                c = os.path.join(root, "webview2", "EBWebView", "Default", "History")
+                if os.path.isfile(c):
+                    hist = c
+                    break
+    HISTORY = hist
+
+    # 数据目录（价格表/账本/样本）
+    dd = cfg.get("data_dir") or ""
+    if not dd or not os.path.isdir(dd):
+        dd = _appdata_dir()
+    try:
+        os.makedirs(dd, exist_ok=True)
+    except Exception:
+        pass
+    WORK_DIR = dd
+    PRICES_PATH = os.path.join(dd, "cache_prices.json")
+    LEDGER_PATH = os.path.join(dd, "cost_ledger.json")
+    SAMPLES_PATH = os.path.join(dd, "calib_samples.json")
+    CALIB_PATH = os.path.join(dd, "proxy_calibration.json")
+    SITE_MERGE_PATH = os.path.join(dd, "site_merge.json")
+
+    # 老版本把数据放在 D:\Hermes works → 平滑迁移一次
+    legacy = r"D:\Hermes works"
+    if os.path.isdir(legacy) and os.path.abspath(legacy) != os.path.abspath(dd):
+        for name in ("cache_prices.json", "cost_ledger.json", "calib_samples.json"):
+            src = os.path.join(legacy, name)
+            dst = os.path.join(dd, name)
+            if os.path.isfile(src) and not os.path.isfile(dst):
+                try:
+                    shutil.copy2(src, dst)
+                except Exception:
+                    pass
+
+    if not hh:
+        return False, "未找到 Hermes 数据目录（需要含 state.db 的 hermes-home 文件夹）"
+    return True, "已连接 %s" % hh
+
+
+def check_schema():
+    """兼容性检查：state.db 是否含所需表。返回 (ok, msg)。"""
+    if not DB or not os.path.isfile(DB):
+        return False, "未找到 state.db"
+    try:
+        con = sqlite3.connect(DB)
+        tabs = {r[0] for r in con.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        con.close()
+    except Exception as ex:
+        return False, "state.db 读取失败：%s" % ex
+    miss = [t for t in ("sessions", "session_model_usage") if t not in tabs]
+    if miss:
+        return False, "state.db 缺少表 %s（Hermes 版本可能不兼容）" % ", ".join(miss)
+    return True, ""
+
+
+def first_run_dialog(msg):
+    """探测失败时让用户手选 hermes-home。返回路径或 None。
+
+    给非本人使用（分发给朋友）留了足够线索：常见路径示例 + 「先开 Hermes」提示。
+    """
+    try:
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        cands = []
+        try:
+            cands = scan_hermes_homes()
+        except Exception:
+            cands = []
+        if cands:
+            sample = "已扫描到以下候选目录（可直接选它）：\n" + "\n".join("  " + c for c in cands[:3])
+        else:
+            sample = ("通常长这样（把「安装盘」换成 D/E/F 等实际盘符）：\n"
+                      "  安装盘:\\Hermes Agent CN Desktop\\data\\hermes-home\n"
+                      "关键：那个文件夹里【直接】有一个 state.db 文件")
+        while True:
+            retry = messagebox.askretrycancel(
+                "Hermes 缓存监控 · 首次配置",
+                "%s\n\n"
+                "★ 请先确认 Hermes 桌面端已经【打开着】，再点「重试」手动选择目录。\n\n"
+                "%s\n\n"
+                "点「取消」退出程序。" % (msg, sample))
+            if not retry:
+                break
+            d = filedialog.askdirectory(title="选择 hermes-home 目录（含 state.db 的那个文件夹）")
+            if d and _valid_home(d):
+                root.destroy()
+                return d
+            messagebox.showwarning(
+                "目录无效",
+                "这个目录下没有找到 state.db，不是 hermes-home。\n\n"
+                "请往上/往下找一层，选到那个【直接包含 state.db】的文件夹。\n"
+                "提示：它通常在 Hermes 安装目录下的 data\\hermes-home\\")
+        root.destroy()
+    except Exception:
+        pass
+    return None
+
+# 字符 → token 系数（2026-09-16 用 calib_samples.json 的 17 个干净会话双变量最小二乘标定）
+#   标定前 1.0000 / 0.2800 → 聚合比值 0.9337（系统性高估 7%）
+#   标定后 1.0714 / 0.2343 → 聚合比值 1.0000（零偏差）
+# 重标定方法：攒够 ≥10 个 calib_samples 后，解 min Σ(cjk*a + non*b − out_recorded)²
+CHAR_PER_TOK_CJK = 1.0714
+CHAR_PER_TOK_OTHER = 0.2343
+
+# 现代极简暗黑配色系统（Zinc 暗调风格，柔和耐看）
+BG = "#16161a"          # 深度碳黑背景
+BG_CARD = "#222228"     # 胶囊与卡片衬底
+BORDER = "#32323a"      # 1px 微边框
+FG = "#f4f4f6"          # 主高亮文字
+DIM = "#94949e"         # 辅助浅灰
+MUTED = "#63636e"       # 弱化次灰
+GREEN = "#4ade80"       # 现代柔和荧光翠绿（不刺眼）
+YELLOW = "#fbbf24"      # 浅暖琥珀金
+RED = "#f87171"         # 柔和浅珊瑚红
+BLUE = "#38bdf8"        # 浅天青蓝
+
+# 字体系统：中文用微软雅黑色（UI版圆润），数字与英文字符用 Windows 原生现代等宽 Cascadia Code
+FONT = ("Microsoft YaHei UI", 9)
+FONT_S = ("Microsoft YaHei UI", 8)
+FONT_L = ("Cascadia Code", 22, "bold")       # 大命中率：等宽精密仪表质感
+FONT_CODE = ("Cascadia Code", 9)            # 关键数字、Token与价格行
+FONT_CODE_S = ("Cascadia Code", 8)          # 紧凑等宽小数字
+FONT_CODE_B = ("Cascadia Code", 10, "bold") # 粗体等宽数字
+
+
+# ─────────────────── 思考档位（reasoning effort，可移植） ───────────────────
+# 写的是 <HERMES_HOME>/config.yaml 里的 agent.reasoning_effort。
+# 只做「行级替换」：只动目标那一行，其余字节原样保留（注释/空行/CRLF 全不动）。
+EFFORT_LEVELS = [
+    ("",        "未设置（跟随服务端默认）"),
+    ("none",    "关闭思考"),
+    ("minimal", "最低"),
+    ("low",     "低"),
+    ("medium",  "中"),
+    ("high",    "高"),
+    ("xhigh",   "很高"),
+    ("max",     "最高"),
+]
+# 这些档位在部分中转站会被拒（HTTP 400）：选中时给提示，但不禁用（换模型就合法）
+EFFORT_RISKY = {"none", "minimal"}
+EFFORT_BACKUP_KEEP = 5
+
+_EFFORT_CACHE = {"t": 0.0, "v": "", "p": ""}
+
+
+def effort_label(level):
+    """档位值 -> 中文名"""
+    for v, name in EFFORT_LEVELS:
+        if v == (level or ""):
+            return name
+    return level or "未设置"
+
+
+def effort_config_path():
+    """config.yaml 路径。优先用运行期解析的 HERMES_HOME，没有就现扫一次。"""
+    hh = HERMES_HOME
+    if not hh:
+        try:
+            found = scan_hermes_homes()
+            hh = found[0] if found else ""
+        except Exception:
+            hh = ""
+    return os.path.join(hh, "config.yaml") if hh else ""
+
+
+def read_effort():
+    """读当前档位。返回 (level, config_path)；读不到时 level 是空串。"""
+    p = effort_config_path()
+    if not p or not os.path.isfile(p):
+        return "", p
+    try:
+        raw = open(p, "r", encoding="utf-8", newline="").read()
+    except Exception:
+        return "", p
+    sep = "\r\n" if "\r\n" in raw else "\n"
+    in_agent = False
+    for ln in raw.split(sep):
+        if ln.startswith("agent:"):
+            in_agent = True
+            continue
+        if in_agent:
+            if ln and not ln.startswith((" ", "\t")):
+                break
+            m = re.match(r"^\s+reasoning_effort:\s*(\S*)\s*$", ln)
+            if m:
+                return m.group(1).strip().strip('"').strip("'"), p
+    return "", p
+
+
+def read_effort_cached(ttl=5.0):
+    """带缓存的读（给每秒刷新的状态行用，避免频繁读盘）。"""
+    now = time.time()
+    if now - _EFFORT_CACHE["t"] < ttl:
+        return _EFFORT_CACHE["v"], _EFFORT_CACHE["p"]
+    v, p = read_effort()
+    _EFFORT_CACHE.update({"t": now, "v": v, "p": p})
+    return v, p
+
+
+def _backup_config(path, raw):
+    """把 config.yaml 备份到数据目录 config_bak/，只留最近几份。"""
+    try:
+        d = os.path.join(_appdata_dir(), "config_bak")
+        os.makedirs(d, exist_ok=True)
+        f = os.path.join(d, "config.yaml.%s.bak" % datetime.now().strftime("%Y%m%d-%H%M%S"))
+        with open(f, "w", encoding="utf-8", newline="") as fh:
+            fh.write(raw)
+        olds = sorted([x for x in os.listdir(d) if x.startswith("config.yaml.")])
+        for x in olds[:-EFFORT_BACKUP_KEEP]:
+            try:
+                os.remove(os.path.join(d, x))
+            except Exception:
+                pass
+        return f
+    except Exception:
+        return ""
+
+
+def _atomic_write_text(path, text):
+    """原子写文本：同目录 tmp → fsync → os.replace。
+
+    ⚠ 为什么必须这样写（原实现是 open(p, "w") 直接截断写）：
+    进程在写入中途被杀 / 磁盘满 / 被杀软拦截时，原文件会留下**半截 YAML**，
+    Hermes 随后启动会因为解析失败而报错。原子替换保证「要么全新内容、要么原样」。
+
+    tmp 必须与目标同目录，os.replace 才是同盘原子替换（跨盘会退化成复制+删除）。
+    """
+    d = os.path.dirname(os.path.abspath(path)) or "."
+    fd, tmp = tempfile.mkstemp(prefix=".cfgwrite_", suffix=".tmp", dir=d)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        try:                    # 尽量沿用原文件权限（Windows 上通常无效，忽略）
+            os.chmod(tmp, os.stat(path).st_mode)
+        except Exception:
+            pass
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
+        raise
+
+
+def write_effort(level):
+    """行级替换写 agent.reasoning_effort。返回 (ok, message)。
+
+    level == "" 表示删除该行（回到未设置）。
+    写前备份、写后读回校验；校验不过自动还原。
+    """
+    p = effort_config_path()
+    if not p:
+        return False, "没找到 config.yaml\n（先确认能识别到 hermes-home）"
+    if not os.path.isfile(p):
+        return False, "config.yaml 不存在：\n%s" % p
+    try:
+        raw = open(p, "r", encoding="utf-8", newline="").read()
+    except Exception as e:
+        return False, "读取失败：%s" % e
+
+    sep = "\r\n" if "\r\n" in raw else "\n"
+    lines = raw.split(sep)
+
+    ai = None
+    for i, ln in enumerate(lines):
+        if ln.startswith("agent:"):
+            ai = i
+            break
+    if ai is None:
+        return False, "config.yaml 里没有 agent: 段，未做修改"
+
+    end = len(lines)
+    for j in range(ai + 1, len(lines)):
+        if lines[j] and not lines[j].startswith((" ", "\t")):
+            end = j
+            break
+
+    target = None
+    for j in range(ai + 1, end):
+        if re.match(r"^\s+reasoning_effort:", lines[j]):
+            target = j
+            break
+
+    new_lines = list(lines)
+    if level:
+        ind = "  "
+        if target is not None:
+            m = re.match(r"^(\s+)", new_lines[target])
+            if m:
+                ind = m.group(1)
+            new_lines[target] = "%sreasoning_effort: %s" % (ind, level)
+        else:
+            for j in range(ai + 1, end):
+                m = re.match(r"^(\s+)\S", new_lines[j])
+                if m:
+                    ind = m.group(1)
+                    break
+            new_lines.insert(ai + 1, "%sreasoning_effort: %s" % (ind, level))
+    else:
+        if target is None:
+            return True, "本来就是「未设置」，没有改动"
+        del new_lines[target]
+
+    bak = _backup_config(p, raw)
+    try:
+        _atomic_write_text(p, sep.join(new_lines))
+    except Exception as e:
+        return False, "写入失败：%s" % e
+
+    _EFFORT_CACHE["t"] = 0.0            # 让缓存失效
+    got, _ = read_effort()
+    if (got or "") != (level or ""):
+        try:
+            _atomic_write_text(p, raw)          # 原子还原
+        except Exception:
+            pass
+        return False, "写回校验失败（已还原）\n备份：%s" % bak
+    return True, "已切到「%s」" % effort_label(level)
+
+
+# ─────────────── 提示注入（environment_hint，可移植） ───────────────
+# 写的是 <HERMES_HOME>/config.yaml 里的 agent.environment_hint。
+# 与 reasoning_effort 的关键差异：它是**多行块标量**（| 或 >），所以要先定位块边界。
+# 仍然只做「行级替换」：只动目标行区间，其余字节级不变（注释/空行/CRLF 全不动）。
+# ⚠ 禁止 import yaml：spec 未打包 pyyaml，exe 会崩。全部手写正则。
+HINT_KEY = "environment_hint"
+HINT_BLOCK_STEP = 4          # 多行块相对键的缩进格数
+_HINT_CACHE = {"t": 0.0, "v": "", "p": "", "present": False}
+
+
+def _ydent(ln):
+    """一行的前导空白格数。"""
+    return len(ln) - len(ln.lstrip(" \t"))
+
+
+def _find_yaml_block(lines, key, section="agent"):
+    """在顶层段 section 内定位 key 的子块。
+
+    返回 (key_idx, block_end, section_end, forced)：
+      key_idx     key 行下标；键不存在时 None
+      block_end   块内容结束位置（不含）；键不存在时 None
+      section_end 段结束位置（不含），用于插入定位；没有该段时 None
+      forced      True = 块边界定位失败，已按「方案 B」强行吃到段尾
+    """
+    si = None
+    for i, ln in enumerate(lines):
+        if re.match(r"^%s:\s*(#.*)?$" % re.escape(section), ln):
+            si = i
+            break
+    if si is None:
+        return None, None, None, False
+
+    sec_end = len(lines)
+    for j in range(si + 1, len(lines)):
+        if lines[j] and not lines[j].startswith((" ", "\t")):
+            sec_end = j
+            break
+
+    ki = None
+    for j in range(si + 1, sec_end):
+        if re.match(r"^(\s+)%s\s*:" % re.escape(key), lines[j]):
+            ki = j
+            break
+    if ki is None:
+        return None, None, sec_end, False
+
+    kind = _ydent(lines[ki])
+    ke = last = ki + 1          # last = 最后一个确认为块内容的行 + 1（尾随空行不算）
+    while ke < sec_end:
+        ln = lines[ke]
+        if not ln.strip():      # 空行：先乐观跳过，若后续判定不在块内则回退
+            ke += 1
+            continue
+        if _ydent(ln) > kind:
+            ke += 1
+            last = ke
+            continue
+        break
+    ke = last
+
+    head_val = lines[ki].split(":", 1)[1].strip()
+    forced = False
+    # 方案 B：声明了块标量却一行内容都没圈到 → 缩进错乱，强行截断到段尾
+    if ke == ki + 1 and head_val[:1] in ("|", ">"):
+        ke = sec_end
+        forced = True
+    return ki, ke, sec_end, forced
+
+
+def _hint_block_base(head_val, body, key_indent):
+    """块内容的基准缩进列数：带数字指示符（|4）按指示符，否则取首个非空行缩进。"""
+    m = re.match(r"^[|>]\s*(\d+)", (head_val or "").strip())
+    if m:
+        return len(key_indent) + int(m.group(1))
+    for ln in body:
+        if ln.strip():
+            return _ydent(ln)
+    return len(key_indent) + 2
+
+
+def _parse_hint_text(raw):
+    """从 config.yaml 原文解析 environment_hint。返回 (text, present)。"""
+    if not raw:
+        return "", False
+    sep = "\r\n" if "\r\n" in raw else "\n"
+    lines = raw.split(sep)
+    ki, ke, _, _ = _find_yaml_block(lines, HINT_KEY)
+    if ki is None:
+        return "", False
+    m = re.match(r"^(\s+)%s\s*:(.*)$" % re.escape(HINT_KEY), lines[ki])
+    if not m:
+        return "", False
+    key_indent, head_val = m.group(1), m.group(2).strip()
+    body = lines[ki + 1:ke]
+    if body:
+        base = _hint_block_base(head_val, body, key_indent)
+        out = []
+        for ln in body:
+            if not ln.strip():
+                out.append("")
+            elif ln[:base].strip() == "":
+                out.append(ln[base:])
+            else:
+                out.append(ln)      # 缩进不足：畸形，原样保留交给上层判断
+        return "\n".join(out).rstrip("\n"), True
+    if head_val[:1] in ("|", ">"):
+        return "", True             # 声明了块标量却没内容
+    if len(head_val) >= 2 and head_val[0] == '"' and head_val[-1] == '"':
+        return head_val[1:-1].replace('\\"', '"').replace("\\\\", "\\"), True
+    if len(head_val) >= 2 and head_val[0] == "'" and head_val[-1] == "'":
+        return head_val[1:-1].replace("''", "'"), True
+    return head_val, True
+
+
+def _format_hint_lines(text, key_indent):
+    """把文本渲染成 environment_hint 的行列表（单行用引号 / 多行用块标量）。"""
+    t = (text or "").replace("\r\n", "\n").rstrip()
+    if "\n" not in t:
+        esc = t.replace("\\", "\\\\").replace('"', '\\"')
+        return ['%s%s: "%s"' % (key_indent, HINT_KEY, esc)]
+    body_indent = key_indent + (" " * HINT_BLOCK_STEP)
+    # 两个指示符都要：
+    #   ① 首行以空格开头时，YAML 会把首行空白当缩进基准 → 必须用显式指示符 |4
+    #   ② 一律加 "-"（strip chomping）：裸 | 是 clip，解析值会多一个尾换行，
+    #      与写入文本对不上（实测踩过），|- 才能让两边精确相等
+    mark = "|4-" if t[:1] in (" ", "\t") else "|-"
+    out = ["%s%s: %s" % (key_indent, HINT_KEY, mark)]
+    for ln in t.split("\n"):
+        out.append((body_indent + ln) if ln.strip() else "")
+    return out
+
+
+def read_hint():
+    """读当前 environment_hint。返回 (text, present, config_path)。"""
+    p = effort_config_path()
+    if not p or not os.path.isfile(p):
+        return "", False, p
+    try:
+        raw = open(p, "r", encoding="utf-8", newline="").read()
+    except Exception:
+        return "", False, p
+    text, present = _parse_hint_text(raw)
+    return text, present, p
+
+
+def read_hint_cached(ttl=5.0):
+    """带缓存的读（给每秒刷新的状态行用，避免频繁读盘）。"""
+    now = time.time()
+    if now - _HINT_CACHE["t"] < ttl:
+        return _HINT_CACHE["v"], _HINT_CACHE["present"], _HINT_CACHE["p"]
+    v, present, p = read_hint()
+    _HINT_CACHE.update({"t": now, "v": v, "present": present, "p": p})
+    return v, present, p
+
+
+def _new_raw_with_hint(raw, text, remove=False):
+    """纯函数：算出改完后的新原文。返回 (new_raw, err, forced)；new_raw=None 表示失败。"""
+    sep = "\r\n" if "\r\n" in raw else "\n"
+    lines = raw.split(sep)
+    ki, ke, sec_end, forced = _find_yaml_block(lines, HINT_KEY)
+    if sec_end is None:
+        return None, "config.yaml 里没有 agent: 段，未做修改", False
+
+    new_lines = list(lines)
+    if ki is not None:
+        del new_lines[ki:ke]
+        key_indent = re.match(r"^(\s+)", lines[ki]).group(1)
+    else:
+        key_indent = "  "
+        for j in range(0, sec_end):
+            m = re.match(r"^(\s+)\S", lines[j])
+            if m:
+                key_indent = m.group(1)
+                break
+
+    if not remove:
+        at = ki if ki is not None else sec_end
+        for k, ln in enumerate(_format_hint_lines(text, key_indent)):
+            new_lines.insert(at + k, ln)
+    return sep.join(new_lines), "", forced
+
+
+def write_hint(text, remove=False):
+    """行级写入 agent.environment_hint。返回 (ok, message)。
+
+    remove=True → 删键（含整块）。写前备份、写后读回校验；校验不过自动还原。
+    """
+    p = effort_config_path()
+    if not p:
+        return False, "没找到 config.yaml\n（先确认能识别到 hermes-home）"
+    if not os.path.isfile(p):
+        return False, "config.yaml 不存在：\n%s" % p
+    try:
+        raw = open(p, "r", encoding="utf-8", newline="").read()
+    except Exception as e:
+        return False, "读取失败：%s" % e
+
+    want = "" if remove else (text or "").replace("\r\n", "\n").rstrip()
+    new_raw, err, forced = _new_raw_with_hint(raw, want, remove=remove)
+    if new_raw is None:
+        return False, err
+    if new_raw == raw:
+        return True, "内容没变，未改动"
+
+    bak = _backup_config(p, raw)
+    try:
+        _atomic_write_text(p, new_raw)
+    except Exception as e:
+        return False, "写入失败：%s" % e
+
+    _HINT_CACHE["t"] = 0.0              # 让缓存失效
+    got, present, _ = read_hint()
+    ok = (not present) if remove else (present and got == want)
+    if not ok:
+        try:
+            _atomic_write_text(p, raw)          # 原子还原
+        except Exception:
+            pass
+        return False, "写回校验失败（已还原）\n备份：%s" % bak
+
+    if remove:
+        msg = "已删除 environment_hint（回到无注入）"
+    else:
+        msg = "已注入 environment_hint（%d 字符 / %d 行）" % (
+            len(want), (want.count("\n") + 1) if want else 0)
+    if forced:
+        msg += ("\n\n⚠ 原有内容的缩进异常，已按「到段尾」方式强行替换，\n"
+                "可能连带移除了 agent: 段里后面的键（备份可还原）。")
+    return True, msg
+
+
+# ─────────────────────────── helpers ───────────────────────────
+
+def fmt_vol(n):
+    n = n or 0
+    if n >= 1_000_000_000:
+        return "%.2fB" % (n / 1e9)
+    if n >= 1_000_000:
+        return "%.2fM" % (n / 1e6)
+    if n >= 1_000:
+        return "%.1fK" % (n / 1e3)
+    return str(int(n))
+
+
+def fmt_money(v, cur="¥"):
+    if v is None:
+        return "--"
+    if abs(v) < 1:
+        return "%s%.4f" % (cur, v)
+    if abs(v) < 10:
+        return "%s%.3f" % (cur, v)      # 1~10 元：保留 3 位，避免跨 1 元时精度视觉跳变
+    return "%s%.2f" % (cur, v)
+
+
+def is_peak(now_hm, segments, day=None, weekend_off=False):
+    """峰谷判定：HH:MM 字符串可直接比大小；支持跨午夜段。
+
+    区间语义统一为**左闭右开 [start, end)**（2026-09-16 与 _overlap 对齐）：
+    这样「08:00-12:00 + 12:00-18:00」在 12:00 这个点只算进后一段，不会双重命中。
+
+    *weekend_off* = 周六日全天按闲时（DeepSeek 2026-08-23 起的规则），
+    需要 *day*（"YYYY-MM-DD"）才能判星期。
+    """
+    if weekend_off and day:
+        try:
+            if datetime.strptime(day, "%Y-%m-%d").weekday() >= 5:
+                return False
+        except ValueError:
+            pass
+    for seg in segments or []:
+        try:
+            s, e = seg[0], seg[1]
+        except Exception:
+            continue
+        if not s or not e or s == e:
+            continue
+        if s < e:
+            if s <= now_hm < e:
+                return True
+        else:                                   # 跨午夜：[s,24:00) ∪ [00:00,e)
+            if now_hm >= s or now_hm < e:
+                return True
+    return False
+
+
+# ---------- 站点域名归一 (site_merge) ----------
+DEFAULT_SITE_MERGE = {
+    "api.dshapi.icu": "api.dshapi.icu",
+    "api2.dshapi.icu": "api.dshapi.icu",
+    "api3.dshapi.icu": "api.dshapi.icu",
+    "api4.dshapi.icu": "api.dshapi.icu",
+}
+_SITE_MERGE_CACHE = None
+_SITE_MERGE_MTIME = 0.0
+
+
+def _get_proxy_monitor_dir():
+    """动态自适应解析 proxy_monitor 目录（支持分发与便携运行）。"""
+    cands = []
+    if getattr(sys, "frozen", False):
+        exe_dir = os.path.dirname(sys.executable)
+        cands.append(os.path.join(exe_dir, "proxy_monitor"))
+    else:
+        cands.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "proxy_monitor"))
+    if "WORK_DIR" in globals() and WORK_DIR:
+        cands.append(os.path.join(WORK_DIR, "proxy_monitor"))
+    appdata = os.environ.get("APPDATA")
+    if appdata:
+        cands.append(os.path.join(appdata, "HermesCacheMonitor", "proxy_monitor"))
+    cands.append(r"D:\Hermes works\proxy_monitor")
+    for p in cands:
+        if p and os.path.isdir(p):
+            return p
+    return cands[0]
+
+
+def load_site_merge():
+    global _SITE_MERGE_CACHE, _SITE_MERGE_MTIME
+    cands = []
+    if "SITE_MERGE_PATH" in globals() and SITE_MERGE_PATH:
+        cands.append(SITE_MERGE_PATH)
+    cands.append(os.path.join(os.environ.get("APPDATA") or "", "HermesCacheMonitor", "site_merge.json"))
+    pm_dir = _get_proxy_monitor_dir()
+    cands.append(os.path.join(pm_dir, "host_alias.json"))
+
+    cand = next((p for p in cands if p and os.path.isfile(p)), None)
+    if not cand:
+        if _SITE_MERGE_CACHE is None:
+            _SITE_MERGE_CACHE = dict(DEFAULT_SITE_MERGE)
+        return _SITE_MERGE_CACHE
+    try:
+        m = os.path.getmtime(cand)
+        if _SITE_MERGE_CACHE is not None and m == _SITE_MERGE_MTIME:
+            return _SITE_MERGE_CACHE
+        with open(cand, "r", encoding="utf-8-sig") as f:
+            d = json.load(f)
+        mapping = d.get("map", d) if isinstance(d, dict) else {}
+        merged = dict(DEFAULT_SITE_MERGE)
+        for k, v in mapping.items():
+            if isinstance(k, str) and isinstance(v, str):
+                merged[k.strip().lower()] = v.strip().lower()
+        _SITE_MERGE_CACHE = merged
+        _SITE_MERGE_MTIME = m
+        return _SITE_MERGE_CACHE
+    except Exception:
+        if _SITE_MERGE_CACHE is None:
+            _SITE_MERGE_CACHE = dict(DEFAULT_SITE_MERGE)
+        return _SITE_MERGE_CACHE
+
+
+def canon_host(h):
+    """站点域名归一（例如 api4.dshapi.icu -> api.dshapi.icu）。"""
+    if not h or not isinstance(h, str):
+        return h or "?"
+    h = h.strip()
+    mapping = load_site_merge()
+    return mapping.get(h.lower(), h)
+
+
+# ─────────────────────────── 站方校准数据管理器 ───────────────────────────
+class CalibManager:
+    """管理站方导出的 proxy_calibration.json，支持会话级和日度级的差值计算。"""
+
+    def __init__(self, path=None):
+        self.path = path or (globals().get("CALIB_PATH") or os.path.join(_appdata_dir(), "proxy_calibration.json"))
+        self._data = None
+        self._mtime = 0.0
+        self.enabled = True
+        self.session_offsets = {}
+
+    def _resolve_path(self):
+        cands = [self.path]
+        if "WORK_DIR" in globals() and WORK_DIR:
+            cands.append(os.path.join(WORK_DIR, "proxy_calibration.json"))
+        cands.append(os.path.join(os.environ.get("APPDATA") or "", "HermesCacheMonitor", "proxy_calibration.json"))
+        cands.append(os.path.join(_get_proxy_monitor_dir(), "proxy_calibration.json"))
+        existing = [p for p in set(cands) if p and os.path.isfile(p)]
+        if not existing:
+            return None
+        return max(existing, key=lambda p: os.path.getmtime(p))
+
+    def load(self, force=False):
+        p = self._resolve_path()
+        if not p:
+            self._data = None
+            return None
+        try:
+            m = os.path.getmtime(p)
+            if not force and self._data is not None and m == self._mtime:
+                return self._data
+            with open(p, "r", encoding="utf-8-sig") as f:
+                d = json.load(f)
+            if isinstance(d, dict) and "sessions" in d:
+                self._data = d
+                self._mtime = m
+                return self._data
+        except Exception as e:
+            _startup_log("读取校准文件失败：%s" % e)
+        return self._data
+
+    def get_session_calib(self, sid):
+        if not self.enabled or not sid:
+            return None
+        data = self.load()
+        if not data:
+            return None
+        return data.get("sessions", {}).get(sid)
+
+    def get_calibration_offset(self, sid, hermes_cost, hermes_cr, hermes_inp):
+        """计算或获取该会话锁定的补差额。
+        
+        规则：
+          - 站方同步时，锁定 补差 = 站方实扣 - hermes检测；
+          - 两次同步之间，无论 hermes 数据怎么上涨，补差锁定不动，直到下次同步；
+          - 若站方无数据，返回 None。
+        """
+        if not self.enabled or not sid:
+            return None
+        data = self.load()
+        if not data:
+            return None
+        site_sess = data.get("sessions", {}).get(sid)
+        if not site_sess:
+            return None
+
+        site_cost = site_sess.get("cost", 0.0)
+        site_cr = site_sess.get("cache_read", 0)
+        site_inp = site_sess.get("in_tokens", 0)
+
+        site_fp = (site_sess.get("last_ts"), site_sess.get("calls"), site_cost)
+        cached = self.session_offsets.get(sid)
+        # 刷新判据：只有首次计算或站方数据指纹真实推进时才重算，绝不因全局文件更新而冲抵补差
+        if cached is None or cached.get("site_fp") != site_fp:
+            diff_cost = max(0.0, site_cost - hermes_cost)
+            diff_cr = max(0, site_cr - hermes_cr)
+            diff_inp = max(0, site_inp - hermes_inp)
+            cached = {
+                "diff_cost": round(diff_cost, 6),
+                "diff_cr": diff_cr,
+                "diff_inp": diff_inp,
+                "site_cost": site_cost,
+                "site_fp": site_fp,
+                "has_calib": True,
+            }
+            self.session_offsets[sid] = cached
+
+        return cached
+
+    def get_daily_calib(self, day, host=None):
+        if not self.enabled:
+            return None
+        data = self.load()
+        if not data:
+            return None
+        day_data = data.get("daily", {}).get(day, {})
+        if host:
+            return day_data.get(canon_host(host))
+        return day_data
+
+
+def trigger_proxy_refresh(sites=None, timeout=15.0):
+    """通知中转站监控立即刷新（支持传入 sites 进行定向极速秒刷新），并确保校准文件必定最新。"""
+    ok = False
+    msg = ""
+    try:
+        import urllib.request
+        from urllib.parse import quote
+        url = "http://127.0.0.1:8788/api/refresh"
+        if sites:
+            valid_sites = [s.strip() for s in sites if s and s != "?"]
+            if valid_sites:
+                url += "?sites=" + quote(",".join(valid_sites))
+        req = urllib.request.Request(url, headers={"User-Agent": "cache_follow"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            if resp.status == 200:
+                ok = True
+                msg = "已定向极速刷新" if sites else "已通过站方服务立即刷新"
+    except Exception:
+        pass
+
+    try:
+        import sys
+        pm_dir = _get_proxy_monitor_dir()
+        if pm_dir not in sys.path:
+            sys.path.insert(0, pm_dir)
+        import session_join, calib_export
+        session_join.main_quiet()
+        calib_export.export_calibration(verbose=False)
+        return True, msg or "已本地完成归集与导出"
+    except Exception as e:
+        return ok, msg or ("导出失败: %s" % e)
+
+
+_DB_CONN = None
+_DB_LOCK = threading.Lock()
+_DB_PATH = None
+
+
+def _db():
+    """复用同一个 sqlite 连接。
+
+    每次 sqlite3.connect() 要 20~160ms（实测，磁盘/杀软抖动），
+    而 tick 每秒都要查库 → 这就是「顿卡」的主因。复用后降到 <1ms。
+    """
+    global _DB_CONN, _DB_PATH
+    if _DB_CONN is None or _DB_PATH != DB:
+        if _DB_CONN is not None:
+            try:
+                _DB_CONN.close()
+            except Exception:
+                pass
+        _DB_CONN = sqlite3.connect(DB, check_same_thread=False, timeout=3.0)
+        _DB_PATH = DB
+    return _DB_CONN
+
+
+def db_query(sql, args=(), one=False):
+    global _DB_CONN
+    with _DB_LOCK:
+        # 最多两轮：① 正常/瞬时异常  ② 连接真坏了 → 重建后重试一次
+        for attempt in (0, 1):
+            try:
+                cur = _db().cursor()
+                cur.execute(sql, args)
+                rows = cur.fetchall()
+                cur.close()
+                return (rows[0] if rows else None) if one else rows
+            except Exception:
+                # ⚠ 只有「连接真的不可用」才拆掉长连接 —— 重连要付 1~160ms（实测磁盘抖动期
+                # 可达 160ms）。瞬时 locked / SQL 写错 / 表不存在都不该连累长连接
+                # （否则一次偶发异常就让后续若干次查询都变慢，正是历史上「规律性顿卡」的成因）。
+                # 判定法：连接还在就用 SELECT 1 探一次；探得通 = 保留，探不通 = 拆。
+                alive = False
+                try:
+                    if _DB_CONN is not None:
+                        _DB_CONN.execute("SELECT 1")
+                        alive = True
+                except Exception:
+                    alive = False
+                if alive:
+                    return None if one else []      # 连接可用 → 保留，下次照样复用
+                try:
+                    if _DB_CONN is not None:
+                        _DB_CONN.close()
+                except Exception:
+                    pass
+                _DB_CONN = None
+                # 落到这里说明连接已拆：第 1 轮重试（重建连接），第 2 轮才真放弃
+        return None if one else []
+
+
+def cover_all_day(segments):
+    """两段是否覆盖全天（用于保存时警告）。"""
+    segs = []
+    for seg in segments or []:
+        try:
+            s, e = seg[0], seg[1]
+        except Exception:
+            continue
+        if not s or not e or s == e:
+            continue
+        if s <= e:
+            segs.append((s, e))
+        else:
+            segs.append((s, "23:59"))
+            segs.append(("00:00", e))
+    if len(segs) < 2:
+        return False
+    segs.sort()
+    cur = segs[0][1]
+    for s, e in segs[1:]:
+        if s > cur:
+            return False
+        cur = max(cur, e)
+    return cur >= "23:59" and segs[0][0] <= "00:01"
+
+
+# ─────────────────────────── 价格表 ───────────────────────────
+
+class PriceBook:
+    def __init__(self, path=None):
+        self.path = path or PRICES_PATH
+        self._mtime = None
+        self._entries = []
+        # 非空 = 「文件在、但读不了」→ 禁止写盘，避免用空表覆盖（见 load 注释）
+        self._load_error = ""
+
+    def load(self, force=False):
+        """读价格表。
+
+        ⚠ 三种情况必须区分（原实现把它们混成一种，导致读失败后保存会清空整个价格表）：
+          ① 文件不存在且从未加载过  → 首次运行，空表，允许写盘
+          ② 文件不存在但加载过      → 被同步工具/杀软移走，**保留内存**，允许写回重建
+                                      （盘上没数据可丢，重建反而保住数据）
+          ③ 文件在但读不了（损坏/被锁/权限）→ **保留内存 + 禁止写盘**
+                                      （盘上还有救得回来的数据，绝不能覆盖）
+        返回当前内存条目列表。
+        """
+        self._load_error = ""
+        try:
+            m = os.path.getmtime(self.path)
+        except FileNotFoundError:
+            self._mtime = None          # 文件没了 → 下次若出现要重读
+            return self._entries        # 保留内存（① 时本就是空表）
+        except OSError as ex:
+            self._load_error = "读不到价格表文件：%s" % ex
+            return self._entries
+        if not force and m == self._mtime:
+            return self._entries
+        try:
+            with open(self.path, "r", encoding="utf-8-sig") as f:
+                data = json.load(f)
+            self._entries = [e for e in data if isinstance(e, dict) and e.get("host")]
+            self._mtime = m
+        except OSError as ex:
+            self._load_error = "价格表被占用：%s" % ex
+        except ValueError as ex:
+            self._load_error = "价格表 JSON 损坏：%s" % ex
+        return self._entries
+
+    def all(self):
+        return list(self.load())
+
+    # ---------- 价格段（时间轴：同一站/模型可随时间改价，历史段不动） ----------
+    @staticmethod
+    def segs(entry):
+        """取条目的价格段列表（按 from 升序）。旧格式（无 periods）→ 空列表。"""
+        ps = (entry or {}).get("periods")
+        if isinstance(ps, list) and ps:
+            return sorted([p for p in ps if isinstance(p, dict)],
+                          key=lambda p: p.get("from") or "")
+        return []
+
+    @staticmethod
+    def pick_seg(entry, day=None):
+        """取 *day* 生效的那一段，与条目公共字段合并成「虚拟条目」。
+
+        day 缺省 = 今天。day 早于所有段 → 用最早段。无 periods → 原样返回（旧格式单段）。
+        """
+        if not entry:
+            return None
+        ps = PriceBook.segs(entry)
+        if not ps:
+            return entry
+        if day is None:                       # 注意：显式传 "" 表示「最早那段」，不能用 or
+            day = datetime.now().strftime("%Y-%m-%d")
+        picked = None
+        for p in ps:
+            f = p.get("from") or ""
+            if f <= day and (picked is None or f > (picked.get("from") or "")):
+                picked = p
+        if picked is None:
+            picked = ps[0]
+        merged = {k: v for k, v in entry.items() if k != "periods"}
+        merged.update(picked)
+        merged["_seg_from"] = picked.get("from") or ""
+        merged["_seg_n"] = len(ps)
+        return merged
+
+    def match(self, host, model, day=None):
+        """三级匹配 + 按 *day* 选价格段（day=None → 当前生效段）。"""
+        self.load()
+        host = host or ""
+        model = model or ""
+        for e in self._entries:                                    # 1. 站+模型精确
+            if e.get("host") == host and e.get("model") == model:
+                return self.pick_seg(e, day)
+        for e in self._entries:                                    # 2. 站默认
+            if e.get("host") == host and e.get("model") in (None, "", "*"):
+                return self.pick_seg(e, day)
+        for e in self._entries:                                    # 3. 全局+模型
+            if e.get("host") == "*" and e.get("model") == model:
+                return self.pick_seg(e, day)
+        return None
+
+    def entry_of(self, host, model):
+        """取原始条目（不选段），供 UI 编辑用。"""
+        self.load()
+        for e in self._entries:
+            if e.get("host") == (host or "") and e.get("model") == (model or ""):
+                return e
+        return None
+
+    def set_seg_ratio(self, host, model, seg_from, ratio):
+        """把倍率写回某一段（保留旧值 ratio_prev）。seg_from="" 表示条目级（旧格式）。"""
+        self.load(force=True)
+        target = None
+        for e in self._entries:
+            if e.get("host") == (host or "") and e.get("model") == (model or ""):
+                target = e
+                break
+        if not target:
+            return False
+        ps = self.segs(target)
+        rec = dict(target)
+        if ps:
+            new_ps = []
+            for p in ps:
+                p = dict(p)
+                if (p.get("from") or "") == (seg_from or ""):
+                    if p.get("ratio") is not None:
+                        p["ratio_prev"] = p.get("ratio")
+                    p["ratio"] = float(ratio)
+                    p.pop("ratio_kept", None)
+                new_ps.append(p)
+            rec["periods"] = new_ps
+        else:
+            if rec.get("ratio") is not None:
+                rec["ratio_prev"] = rec.get("ratio")
+            rec["ratio"] = float(ratio)
+        rec["updated"] = datetime.now().strftime("%Y-%m-%d")
+        self.upsert(rec, keep_ratio=False)
+        return True
+
+    def upsert(self, entry, keep_ratio=True):
+        """写入条目（同 host+model 覆盖）。
+
+        keep_ratio：倍率沿用保护（防「倍率框留空 / 新建同键条目」把校准过的倍率静默重置成 1.0）
+          * 新格式（periods）：按 from 一对一沿用段内倍率
+          * 旧格式（条目级）：新条目没带 ratio 而旧条目有 → 沿用
+        想显式改回 1.0：填 1（不是留空）。
+        """
+        self.load(force=True)
+        host, model = entry.get("host"), entry.get("model")
+        entry = dict(entry)
+        if keep_ratio:
+            old = None
+            for e in self._entries:
+                if e.get("host") == host and e.get("model") == model:
+                    old = e
+                    break
+            if old:
+                new_ps = entry.get("periods")
+                old_ps = self.segs(old)
+                if isinstance(new_ps, list) and new_ps and old_ps:
+                    keep = {}
+                    for p in old_ps:
+                        try:
+                            r = float(p.get("ratio") or 0)
+                        except (TypeError, ValueError):
+                            r = 0.0
+                        if r and abs(r - 1.0) > 1e-9:
+                            keep[p.get("from") or ""] = r
+                    for p in new_ps:
+                        if not p.get("ratio") and keep.get(p.get("from") or ""):
+                            p["ratio"] = keep[p.get("from") or ""]
+                            p["ratio_kept"] = True
+                elif not isinstance(new_ps, list) and not entry.get("ratio"):
+                    try:
+                        r = float(old.get("ratio") or 0)
+                    except (TypeError, ValueError):
+                        r = 0.0
+                    if r and abs(r - 1.0) > 1e-9:
+                        entry["ratio"] = r          # 沿用旧倍率
+                        entry["ratio_kept"] = True  # 供 UI 提示（不参与匹配语义）
+        out = []
+        replaced = False
+        for e in self._entries:
+            if e.get("host") == host and e.get("model") == model:
+                out.append(entry)
+                replaced = True
+            else:
+                out.append(e)
+        if not replaced:
+            out.append(entry)
+        self._write(out)
+        return entry
+
+    def delete(self, host, model):
+        self.load(force=True)
+        out = [e for e in self._entries
+               if not (e.get("host") == host and e.get("model") == model)]
+        self._write(out)
+
+    def _write(self, entries):
+        """原子写价格表。读失败时拒绝写入（否则会用空表覆盖掉能救回的数据）。"""
+        if self._load_error:
+            raise RuntimeError(
+                "价格表读不到（%s）\n已拒绝写入，避免清空原文件。\n"
+                "请确认文件未被其他程序占用后重试。" % self._load_error)
+        tmp = self.path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(entries, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, self.path)
+        self._mtime = None
+        self.load(force=True)
+
+
+def sync_prices_from_proxy(price_book):
+    """从中转站数据库（store.db）扫描各站点真实扣费与 token，反推真实价格/倍率并写入价格表。"""
+    pm_db = os.path.join(_get_proxy_monitor_dir(), "store.db")
+    if not os.path.isfile(pm_db):
+        return False, "未找到中转站数据库"
+    try:
+        import sqlite3
+        con = sqlite3.connect("file:%s?mode=ro" % pm_db.replace("\\", "/"), uri=True)
+        cur = con.cursor()
+        rows = cur.execute("""
+            SELECT site, model, COUNT(*), SUM(in_tokens), SUM(cache_read), SUM(out_tokens), SUM(cost)
+            FROM usage_flows
+            WHERE request_id NOT LIKE 'sub2api-daily:%' AND request_id NOT LIKE 'sub2api-model:%'
+            GROUP BY site, model
+        """).fetchall()
+        con.close()
+        if not rows:
+            return False, "无有效中转流水数据"
+
+        count = 0
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        for site, model, n, inp, cr, out, cost in rows:
+            if not model or model == "*" or n < 3:
+                continue
+            entry = price_book.entry_of(site, model)
+            if not entry:
+                entry = price_book.entry_of("*", model) or {}
+                p_in = float(entry.get("in") or 1.0)
+                p_cr = float(entry.get("cache") or 0.2)
+                p_out = float(entry.get("out") or 2.0)
+            else:
+                p_in = float(entry.get("in") or 1.0)
+                p_cr = float(entry.get("cache") or 0.2)
+                p_out = float(entry.get("out") or 2.0)
+
+            # 理论标价
+            nom = (inp / 1e6) * p_in + (cr / 1e6) * p_cr + (out / 1e6) * p_out
+            if nom > 0:
+                eff_ratio = round(cost / nom, 4)
+            else:
+                eff_ratio = 1.0
+
+            new_entry = {
+                "host": site,
+                "model": model,
+                "in": p_in,
+                "cache": p_cr,
+                "out": p_out,
+                "ratio": eff_ratio,
+                "cur": "CNY",
+                "note": "中转站实扣自动同步 (基于%d条流水)" % n,
+                "updated": today_str
+            }
+            price_book.upsert(new_entry, keep_ratio=False)
+            count += 1
+
+        price_book._write(price_book._entries)
+        return True, "已成功从真实流水同步 %d 个模型实扣价格与倍率！" % count
+    except Exception as e:
+        return False, "同步失败：%s" % e
+
+
+def compute_cost(entry, miss, hit, out, now_hm=None, day=None):
+    """按价格条目算成本。返回 dict 或 None（未配价）。
+
+    *ratio* = 实收倍率（对齐站点真实账单）：成本与"缓存省"都要乘它。
+    *day* = "YYYY-MM-DD"，用于峰谷的周末判定（weekend_off）。
+
+    ⚠ 不要把 reasoning（思考）token 加进 out 计费（2026-09-22 试过并回退）：
+      证据 = 有站方 token 明细的锚点站（tokenrhythm）显示「站方 out = 我们 out」
+      （10,310,178 vs 10,326,347，差 0.16%），说明站方输出列就是**可见输出**，
+      不含 thinking。加上 reasoning 会让该站虚增 59%（实测 ¥490.99 → ¥546.47）。
+    """
+    if not entry:
+        return None
+    cur = entry.get("cur") or "¥"
+    try:
+        ratio = float(entry.get("ratio") or 1.0)
+    except (TypeError, ValueError):
+        ratio = 1.0
+    if entry.get("tag") == "免费":
+        return {"cost": 0.0, "saved": 0.0, "list_cost": 0.0, "cur": cur,
+                "free": True, "period": None, "ratio": ratio,
+                "seg_from": entry.get("_seg_from") or ""}
+    grp = entry
+    period = None
+    if entry.get("peak") or entry.get("off"):
+        hm = now_hm or datetime.now().strftime("%H:%M")
+        peak = is_peak(hm, entry.get("peak_hours") or [], day=day,
+                       weekend_off=bool(entry.get("weekend_off")))
+        grp = (entry.get("peak") if peak else entry.get("off")) or entry
+        period = "峰" if peak else "谷"
+    pin = float(grp.get("in") or 0)
+    pout = float(grp.get("out") or 0)
+    pcache = float(grp.get("cache") or 0)
+    raw = (miss * pin + hit * pcache + out * pout) / 1e6
+    return {
+        "cost": raw * ratio,
+        "list_cost": raw,
+        "saved": hit * (pin - pcache) / 1e6 * ratio,
+        "cur": cur,
+        "free": False,
+        "period": period,
+        "ratio": ratio,
+        "seg_from": entry.get("_seg_from") or "",
+    }
+
+
+# ─────────────────────────── 日志账本（缺账检测） ───────────────────────────
+
+RE_LINE = re.compile(r"^(?P<ts>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d+ \w+ (?P<rest>.*)$")
+RE_CREATED = re.compile(r"^run_agent: OpenAI client created \(chat_completion")
+RE_CALL = re.compile(
+    r"^(?:\[(?P<sid>[0-9A-Za-z_\-]+)\] )?agent\.conversation_loop: API call #(?P<n>\d+): "
+    r"model=(?P<model>\S+) provider=(?P<prov>\S+) in=(?P<in>\d+) out=(?P<out>\d+) "
+    r"total=(?P<tot>\d+) latency=(?P<lat>[\d.]+)s(?P<rest>.*)")
+RE_CACHE = re.compile(r"cache=(\d+)/(\d+)")
+RE_TURN = re.compile(
+    r"^(?:\[(?P<sid>[0-9A-Za-z_\-]+)\] )?agent\.turn_context: conversation turn: session=(?P<sid2>[0-9A-Za-z_\-]+)")
+RE_ENDED = re.compile(
+    r"^(?:\[(?P<sid>[0-9A-Za-z_\-]+)\] )?agent\.conversation_loop: Turn ended: reason=(?P<reason>\S+)")
+
+
+class Ledger:
+    """增量 tail agent.log（含轮转），聚合 per-session 的请求/记账事件。
+
+    关键：created 行没有 session id，按「当前回合」归属（turn_context 行划定）。
+    重复读取用整行去重，保证轮转重扫不会重复计数。
+    """
+
+    FILES = ("agent.log.3", "agent.log.2", "agent.log.1", "agent.log")
+    FIRST_TAIL_BYTES = 1_000_000
+
+    def __init__(self, log_dir=None):
+        self.dir = log_dir or LOGS_DIR
+        self.pos = {}
+        self.seen_set = set()
+        self.seen_order = collections.deque()
+        self.events = collections.deque(maxlen=40000)      # (ts, kind, sid, payload)
+        self.sessions = {}                                  # sid -> stat
+        self.turns = collections.deque(maxlen=3000)         # (ts, sid)
+        self.cur_turn_sid = None
+        self.earliest_ts = None
+        self._first = True
+        self.last_poll = 0.0
+
+    def _new_sess(self):
+        return {"calls": [], "created": 0, "interrupts": 0, "unassigned": 0}
+
+    def _stat(self, sid):
+        s = self.sessions.get(sid)
+        if s is None:
+            s = self.sessions[sid] = self._new_sess()
+        return s
+
+    def _check_rotation(self):
+        """agent.log 被轮转时（新文件比记录的读取位置短）→ offset 顺移到 .1/.2/.3。
+
+        不做这步的话，旧 agent.log 里「已读位置 → 文件末尾」那一段会永久丢失。
+        """
+        try:
+            size = os.path.getsize(os.path.join(self.dir, "agent.log"))
+        except OSError:
+            return
+        off = self.pos.get("agent.log")
+        if off is None or size >= off:
+            return
+        self.pos["agent.log.3"] = self.pos.get("agent.log.2", 0)
+        self.pos["agent.log.2"] = self.pos.get("agent.log.1", 0)
+        self.pos["agent.log.1"] = off
+        self.pos["agent.log"] = 0
+
+    def poll(self):
+        self._check_rotation()
+        for name in self.FILES:
+            path = os.path.join(self.dir, name)
+            try:
+                size = os.path.getsize(path)
+            except OSError:
+                continue
+            off = self.pos.get(name, 0)
+            partial = False
+            if self._first and name != "agent.log":
+                off = max(0, size - self.FIRST_TAIL_BYTES)
+                partial = off > 0
+            if size < off:          # 未预料的截断
+                off = 0
+                partial = False
+            if size <= off:
+                self.pos[name] = size
+                continue
+            try:
+                # 二进制读取：tell() 是精确字节偏移，与 getsize 同口径（文本模式下的
+                # tell() 是解码器 cookie，遇中文可能偏移，导致漏读/重复）
+                with open(path, "rb") as f:
+                    if off:
+                        f.seek(off)
+                    if partial:
+                        f.readline()        # 丢弃半行
+                    for raw in f:
+                        self._feed(raw.decode("utf-8", "replace"))
+                    self.pos[name] = f.tell()
+            except Exception:
+                continue
+        self._first = False
+        self.last_poll = time.time()
+
+    def _feed(self, line):
+        line = line.rstrip("\r\n")
+        if not line:
+            return
+        if line in self.seen_set:
+            return
+        self.seen_set.add(line)
+        self.seen_order.append(line)
+        if len(self.seen_order) > 200000:
+            old = self.seen_order.popleft()
+            self.seen_set.discard(old)
+
+        m = RE_LINE.match(line)
+        if not m:
+            # 行首不是「时间戳,毫秒 级别」→ 工具输出回显/多行续行，一律跳过
+            return
+        ts = m.group("ts")
+        rest = m.group("rest")
+        if not self.earliest_ts or ts < self.earliest_ts:
+            self.earliest_ts = ts
+
+        if RE_CREATED.match(rest):
+            sid = self.cur_turn_sid
+            if sid:
+                self._stat(sid)["created"] += 1
+            else:
+                self.sessions.setdefault("__unassigned__", self._new_sess())["unassigned"] += 1
+            self.events.append((ts, "created", sid, None))
+            return
+
+        m = RE_TURN.match(rest)
+        if m:
+            sid = m.group("sid2")
+            self.cur_turn_sid = sid
+            self._stat(sid)
+            self.turns.append((ts, sid))
+            self.events.append((ts, "turn", sid, None))
+            return
+
+        m = RE_CALL.match(rest)
+        if m:
+            sid = m.group("sid") or self.cur_turn_sid
+            cm = RE_CACHE.search(m.group("rest"))
+            rec = {
+                "ts": ts, "n": int(m.group("n")),
+                "in": int(m.group("in")), "out": int(m.group("out")),
+                "hit": int(cm.group(1)) if cm else 0,
+            }
+            self._stat(sid)["calls"].append(rec)
+            self.events.append((ts, "call", sid, rec))
+            return
+
+        m = RE_ENDED.match(rest)
+        if m:
+            sid = m.group("sid") or self.cur_turn_sid
+            reason = m.group("reason")
+            if "interrupt" in reason:
+                self._stat(sid)["interrupts"] += 1
+                self.events.append((ts, "interrupt", sid, reason))
+            else:
+                self.events.append((ts, "ended", sid, reason))
+            if self.cur_turn_sid == sid:
+                self.cur_turn_sid = None
+            return
+
+    # -------- 查询 --------
+
+    def stat(self, sid):
+        return self.sessions.get(sid)
+
+    def unmatched(self, sid, limit=60, grace_sec=90):
+        """未配对的 created 时间点（= 缺账请求）。顺序配对：created 入队，call 出队。
+
+        *grace_sec* 内刚发出的 created 视为「进行中的请求」，不算缺账。
+        """
+        pend = []
+        for ts, kind, esid, _ in self.events:
+            if esid != sid:
+                continue
+            if kind == "created":
+                pend.append(ts)
+            elif kind == "call" and pend:
+                pend.pop(0)
+        if pend and grace_sec:
+            t = _ts_to_epoch(pend[-1])
+            if t and (time.time() - t) < grace_sec:
+                pend.pop()
+        return pend[-limit:]
+
+    def in_flight(self, sid, grace_sec=90):
+        """最后一个 created 是否可能仍在进行中（刚发出、还没记账）。"""
+        pend = self.unmatched(sid, grace_sec=0)
+        if not pend:
+            return False
+        t = _ts_to_epoch(pend[-1])
+        return bool(t and (time.time() - t) < grace_sec)
+
+    def concurrent_at(self, sid, ts, window=120):
+        """该时刻附近是否有其它会话的回合（归属可能不准 → 降级）。"""
+        if not ts:
+            return False
+        try:
+            t = datetime.strptime(ts, "%Y-%m-%d %H:%M:%S").timestamp()
+        except Exception:
+            return False
+        for ots, osid in self.turns:
+            if osid == sid or not ots:
+                continue
+            try:
+                ot = datetime.strptime(ots, "%Y-%m-%d %H:%M:%S").timestamp()
+            except Exception:
+                continue
+            if abs(ot - t) <= window:
+                return True
+        return False
+
+    def report(self, sid):
+        """返回该会话的账目对账结果。"""
+        s = self.sessions.get(sid)
+        if not s:
+            return None
+        A = len(s["calls"])
+        R = max(s["created"], A)      # created 行覆盖全部请求（成功记账的也先发 created）
+        pend_all = self.unmatched(sid, grace_sec=0)
+        inflight_ts = None
+        if pend_all:
+            t_last = _ts_to_epoch(pend_all[-1])
+            if t_last and (time.time() - t_last) < 90:
+                inflight_ts = pend_all[-1]        # 刚发出、还没记账 → 进行中
+        gaps = list(pend_all[:-1]) if inflight_ts else list(pend_all)
+        G = max(0, R - A - (1 if inflight_ts else 0))
+        if G <= 0:
+            gaps = []                 # 语义一致：没缺账就不列明细
+        elif len(gaps) > G:
+            gaps = gaps[-G:]
+        return {
+            "recorded": A, "real": R, "gap": G, "gaps": gaps,
+            "inflight": inflight_ts,
+            "interrupts": s["interrupts"],
+            "partial": self._partial(s),
+            "concurrent": any(self.concurrent_at(sid, t) for t in gaps),
+        }
+
+    def _partial(self, s):
+        """该会话最早的记账记录是否正好压在日志起点 → 日志可能未覆盖全程。"""
+        calls = s.get("calls") or []
+        if not calls or not self.earliest_ts:
+            return False
+        return abs(_ts_delta(calls[0]["ts"], self.earliest_ts)) <= 60
+
+
+# ─────────────────────────── 监控核心 ───────────────────────────
+
+class Monitor:
+    def __init__(self):
+        self.hist_mtime = 0
+        self.cur_sid = None
+        self.last_sid = None
+        self.last_info = None
+        self.last_info_at = 0.0
+        self._uia_btn = None
+        self._uia_last_try = 0.0
+        self._hist_last_try = 0.0
+        self._chg_times = []          # 最近几次跟随目标的变更时刻（用于识别 UIA 抖动）
+        self._lock_until = 0.0
+        self._followed_sid = None
+        self._followed_at = 0.0
+        self.last_refresh = None      # 上次手动刷新的结果 {sid, via, at}
+        self._sid_lock = threading.Lock()
+        self.prices = PriceBook()
+        self.ledger = Ledger()
+        self.cost_ledger = CostLedger(path=LEDGER_PATH, prices=self.prices)
+        self.calib_mgr = CalibManager()
+        # 内置中转站采集轮询守护（300秒一次，免外部独立进程常驻）
+        self._start_proxy_daemon()
+        # UIA 跨进程读取要 30~70ms（实测），放主线程里每秒卡一下 → 挪到后台线程
+        self._worker = threading.Thread(target=self._follow_loop, daemon=True)
+        self._worker.start()
+        self._chars_cache = {}
+        self._sample_last_sid = None
+        self._sample_last_try = 0.0
+
+    # ---------- signal: webview2 history ----------
+    def _read_latest_task_sid(self):
+        now_t = time.time()
+        if now_t - self._hist_last_try < 3.0:    # 限流：最多 3 秒探一次（该信号本身延迟大）
+            return self.cur_sid
+        self._hist_last_try = now_t
+        try:
+            mtime = os.path.getmtime(HISTORY)
+        except Exception:
+            return self.cur_sid
+        if mtime == self.hist_mtime and self.cur_sid is not None:
+            return self.cur_sid
+        # History 库是 WebView2 常驻写的库，实测 journal_mode=delete（非 WAL）。
+        # 用 mode=ro 直连会 100% 撞 database is locked 且白等 ~950ms；immutable=1 实测 3ms。
+        # ⚠ immutable 只对非 WAL 库安全 —— 主库/UI_DB 是 WAL，禁用该标志（会漏 -wal 里的最新数据）。
+        # 临时文件用 mkstemp 唯一名：主线程（手动刷新/current）与后台跟随线程都会走到这里，
+        # 原来写死的固定路径没有互斥，两方会互相踩（2026-09-22 修）。
+        fd, tmp = tempfile.mkstemp(prefix="hermes_hist_", suffix=".db")
+        os.close(fd)
+        try:
+            for mode in ("immutable", "copy"):
+                try:
+                    if mode == "immutable":
+                        uri = "file:%s?immutable=1" % quote(
+                            HISTORY.replace("\\", "/"), safe="/:")
+                        con = sqlite3.connect(uri, uri=True, timeout=0.4)
+                    else:
+                        shutil.copy2(HISTORY, tmp)
+                        con = sqlite3.connect(tmp)
+                    cur = con.cursor()
+                    cur.execute(
+                        "SELECT url FROM urls WHERE url LIKE '%#/tasks/%' "
+                        "ORDER BY last_visit_time DESC LIMIT 1")
+                    row = cur.fetchone()
+                    con.close()
+                    sid = self._extract_sid(row[0]) if row else None
+                    self.cur_sid = sid
+                    self.hist_mtime = mtime
+                    return sid
+                except Exception:
+                    continue
+            return self.cur_sid
+        finally:
+            try:
+                os.remove(tmp)
+            except Exception:
+                pass
+
+    def _extract_sid(self, url):
+        try:
+            frag = url.split("#/tasks/", 1)[1]
+            sid = frag.split("?")[0].split("/")[0].strip()
+            if not sid:
+                return None
+            if len(sid) <= 12 and "_" not in sid and not sid.startswith("cron"):
+                resolved = self._resolve_short(sid)
+                return resolved or sid
+            return sid
+        except Exception:
+            return None
+
+    def _resolve_short(self, short):
+        try:
+            con = sqlite3.connect(UI_DB)
+            cur = con.cursor()
+            cur.execute("SELECT value_json FROM ui_kv WHERE key='hermes:gateway-session-map'")
+            row = cur.fetchone()
+            con.close()
+            if row:
+                data = json.loads(row[0])
+                v = data.get(short)
+                if v and v.get("persistentId"):
+                    return v["persistentId"]
+        except Exception:
+            pass
+        return None
+
+    # ---------- signal: UI automation (realtime) ----------
+    def _read_uia_sid(self):
+        if _uia is None or _NO_UIA:
+            return None
+        if self._uia_btn is not None:
+            nm = None
+            for _try in range(2):            # 元素偶发读失败 → 重试一次再放弃（避免频繁重扫）
+                try:
+                    nm = self._uia_btn.Name
+                    break
+                except Exception:
+                    time.sleep(0.03)
+            if nm and "复制会话 ID" in nm:
+                m = re.match(r"复制会话 ID\s+(\S+)", nm.strip())
+                if m:
+                    sid = m.group(1)
+                    if len(sid) <= 12 and "_" not in sid:
+                        sid = self._resolve_short(sid) or sid
+                    return sid
+            # 元素失效 → 置空重扫。这里**不受 _uia_last_try 限流**：元素已明确失效时
+            # 再等 0.5 秒只会白等（手动刷新点下去就卡住，2026-09-22 实测 213ms → 0.9ms 的关键）
+            self._uia_btn = None
+            self._uia_last_try = 0.0
+        now = time.time()
+        if now - self._uia_last_try < 0.5:   # 换对话后最多 0.5 秒重新扫描 UI（原 2 秒太钝）
+            return None
+        self._uia_last_try = now
+        try:
+            win = _uia.WindowControl(searchDepth=1, RegexName="Hermes Agent")
+            if not win.Exists(1, 0.2):
+                return None
+            btn = _uia.ButtonControl(searchFromControl=win, RegexName="复制会话 ID", searchDepth=30)
+            if btn.Exists(2, 0.3):
+                nm = btn.Name
+                m = re.match(r"复制会话 ID\s+(\S+)", (nm or "").strip())
+                if m:
+                    self._uia_btn = btn
+                    sid = m.group(1)
+                    if len(sid) <= 12 and "_" not in sid:
+                        sid = self._resolve_short(sid) or sid
+                    return sid
+        except Exception:
+            pass
+        return None
+
+    # ---------- fallback: latest api activity ----------
+    def _smu_latest(self):
+        row = db_query(
+            "SELECT session_id FROM session_model_usage "
+            "WHERE session_id NOT LIKE 'cron%' ORDER BY last_seen DESC LIMIT 1", one=True)
+        return row[0] if row else None
+
+    # ---------- session info ----------
+    def _session_info(self, sid):
+        row = db_query(
+            "SELECT title, model, billing_provider, billing_base_url, "
+            "COALESCE(input_tokens,0), COALESCE(cache_read_tokens,0), "
+            "COALESCE(output_tokens,0), COALESCE(api_call_count,0), "
+            "COALESCE(source,'desktop') FROM sessions WHERE id=?", (sid,), one=True)
+        if not row:
+            return {"sid": sid, "title": None, "rate": None, "inp": 0, "cr": 0, "out": 0,
+                    "calls": 0, "site": "?", "model": "?", "source": "?", "parent": None}
+        title, model, prov, burl, inp, cr, out, calls, src = row
+        rate = (cr * 100.0 / (inp + cr)) if (inp + cr) > 0 else None
+        try:
+            site = canon_host(urlparse(burl).hostname or prov or "?")
+        except Exception:
+            site = canon_host(prov or "?")
+        return {"sid": sid, "title": title, "rate": rate, "inp": inp, "cr": cr, "out": out,
+                "calls": calls, "site": site, "model": model or "?", "source": src}
+
+    # ---------- 子代理 ----------
+    def _children(self, sid):
+        """取子会话（delegate_task 产生的）。
+
+        ⚠ 2026-09-22 修：原来条件是 `source='subagent'`，但 Hermes 内核改了行为 ——
+        实测 `subagent` 这个 source 最后出现在 2026-09-18，之后的子会话（9/21、9/22）
+        全标成 `source='desktop'` + 带 `parent_session_id`，于是旧条件一条都匹配不到，
+        **子代理的账全漏**（实测某对话 3 个子代理占 85% 的 token 量）。
+        改用「有 parent_session_id 即为子会话」→ 新老两种形态都能覆盖
+        （全库：有 parent 的 = 52 条，其中标 subagent 的 47 条）。
+        """
+        return db_query(
+            "SELECT id, model, billing_base_url, billing_provider, "
+            "COALESCE(input_tokens,0), COALESCE(cache_read_tokens,0), "
+            "COALESCE(output_tokens,0) "
+            "FROM sessions WHERE parent_session_id=?", (sid,))
+
+    def _children_cost(self, sid, now_hm, day=None):
+        """子代理成本：按「当天生效的价格段」匹配（与父对话 CostLedger 同口径）。"""
+        total = 0.0
+        n = 0
+        unpriced = 0
+        cur = "¥"
+        if day is None:
+            day = datetime.now().strftime("%Y-%m-%d")
+        for cid, cmodel, cburl, cprov, cin, ccr, cout in self._children(sid):
+            n += 1
+            try:
+                chost = canon_host(urlparse(cburl).hostname or cprov or "?")
+            except Exception:
+                chost = canon_host(cprov or "?")
+            entry = self.prices.match(chost, cmodel, day)
+            r = compute_cost(entry, cin, ccr, cout, now_hm, day=day)
+            if r is None:
+                unpriced += 1
+            else:
+                total += r["cost"]
+                cur = r["cur"]
+        return {"count": n, "cost": total, "unpriced": unpriced, "cur": cur}
+
+    # ---------- 输出/输入估算 ----------
+    def _msg_chars(self, sid):
+        """统计该会话 assistant 消息的 CJK / 非 CJK 字符数（**增量累加**）。
+
+        原实现每次全量扫 + 逐字符遍历（实测 20~219ms，会话越长越慢），
+        而缺账>0 时每 5 秒就跑一轮 → 常驻卡顿。
+        改成：按 rowid 增量只统计新增行，旧结果复用缓存。
+        缓存键含 (条数, 字符总数, max_rowid)，三者任一变化才重算增量部分。
+        """
+        agg = db_query(
+            "SELECT COUNT(*), COALESCE(SUM(length(COALESCE(reasoning,''))+"
+            "length(COALESCE(content,''))+length(COALESCE(tool_calls,''))),0), "
+            "COALESCE(MAX(rowid),0) FROM messages WHERE session_id=? AND role='assistant'",
+            (sid,), one=True)
+        n, total, maxrid = (agg or (0, 0, 0))
+        c = self._chars_cache.get(sid)
+        if c and c.get("n") == n and c.get("total") == total:
+            return c["val"]                       # 完全没变 → 直接返回
+
+        if c and n > c.get("n", 0) and maxrid > c.get("maxrid", 0):
+            base = c["val"]                       # 增量：只读新增行
+            since = c["maxrid"]
+        else:
+            base, since = (0, 0), 0               # 冷启 / 会话被改写 → 全量重算
+
+        add_cjk = add_other = 0
+        for r in db_query(
+                "SELECT reasoning, content, tool_calls FROM messages "
+                "WHERE session_id=? AND role='assistant' AND rowid>?",
+                (sid, since)):
+            for t in r:
+                if not t:
+                    continue
+                n_cjk = 0
+                for ch in t:
+                    if "\u4e00" <= ch <= "\u9fff":
+                        n_cjk += 1
+                add_cjk += n_cjk
+                add_other += len(t) - n_cjk
+        val = (base[0] + add_cjk, base[1] + add_other)
+        self._chars_cache[sid] = {"n": n, "total": total, "maxrid": maxrid, "val": val}
+        if len(self._chars_cache) > 64:           # 切了很多对话时别无限增长
+            try:
+                self._chars_cache.pop(next(iter(self._chars_cache)))
+            except Exception:
+                pass
+        return val
+
+    def _length_marks(self, sid):
+        """该会话 finish_reason=length 的消息时间戳（用于缺账分类）。"""
+        rows = db_query(
+            "SELECT timestamp FROM messages WHERE session_id=? AND finish_reason='length'",
+            (sid,))
+        return [r[0] for r in rows if r and r[0]]
+
+    def _estimate(self, sid, info, rep):
+        """缺账估算：输入用记账锚点（逐次定位），输出用落库字符换算（固定系数）。"""
+        if not rep or rep["gap"] <= 0:
+            return None
+        st = self.ledger.stat(sid)
+        calls = (st or {}).get("calls") or []
+        if not calls:
+            return None
+
+        # 命中率取累计加权（单次可能恰好是缓存失效那一次，波动大）
+        tot_in = sum(c["in"] for c in calls) or 1
+        hit_ratio = sum(c["hit"] for c in calls) / tot_in
+
+        # 每次缺账按「此前最近一次记账调用」的 prompt 规模锚定（上下文单调递增）
+        est_in = 0
+        for ts in rep["gaps"]:
+            anchor = calls[0]["in"]
+            for c in calls:
+                if c["ts"] <= ts:
+                    anchor = c["in"]
+                else:
+                    break
+            est_in += anchor
+        if est_in <= 0:      # gaps 列表已被事件窗口挤掉 → 退化用最后一次锚点 × 次数
+            est_in = int(calls[-1]["in"] * rep["gap"])
+        est_hit = int(est_in * hit_ratio)
+        est_miss = est_in - est_hit
+
+        cjk, other = self._msg_chars(sid)
+        est_total_out = int(cjk * CHAR_PER_TOK_CJK + other * CHAR_PER_TOK_OTHER)
+        on_record = sum(c["out"] for c in calls)
+        est_gap_out = max(0, est_total_out - on_record)
+
+        return {
+            "in": est_in, "miss": est_miss, "hit": est_hit, "out": est_gap_out,
+            "anchor_in": calls[-1]["in"], "hit_ratio": hit_ratio,
+            "anchor_ts": calls[-1]["ts"],
+            "note": "输入=逐次锚定（真实上界）· 输出=落库字符换算（固定系数，±20%）",
+        }
+
+    def _gap_types(self, sid, rep):
+        """给缺账时间点打类型标签。
+
+        中断：从后往前配对 —— 中断发生时被取消的就是「最后一个」发起的请求，
+        一个中断事件只认一次；其余缺账再看是否落在输出截断（length）轮次附近。
+        """
+        gaps = rep.get("gaps") or []
+        ints = [(ts, esid) for ts, kind, esid, _ in self.ledger.events
+                if kind == "interrupt" and esid == sid and ts]
+        assigned = {}
+        used = set()
+        for i in range(len(gaps) - 1, -1, -1):
+            t0 = _ts_to_epoch(gaps[i])
+            for j, (ets, _s) in enumerate(ints):
+                if j in used:
+                    continue
+                d = _ts_to_epoch(ets) - t0
+                if -30 <= d <= 300:
+                    assigned[i] = "中断"
+                    used.add(j)
+                    break
+        marks = None
+        out = []
+        for i, ts in enumerate(gaps):
+            kind = assigned.get(i)
+            if kind is None:
+                if marks is None:
+                    marks = self._length_marks(sid)
+                t0 = _ts_to_epoch(ts)
+                kind = "截断" if any(-60 <= (m - t0) <= 900 for m in marks) else "未归类"
+            out.append((ts, kind))
+        return out
+
+    # ---------- 样本采集（用于离线拟合字符→token 系数） ----------
+    def collect_sample(self):
+        """把「干净会话」（无缺账、无截断、字符量足）记进 calib_samples.json。
+
+        条件：gap==0、非 partial、无 finish_reason=length 消息、字符量 ≥2 万、desktop 源。
+        采集不自动改代码常量 —— 只攒样本，拟合由人跑脚本后确认。
+        """
+        sid = self.last_sid
+        if not sid or sid == self._sample_last_sid:
+            return
+        now = time.time()
+        if now - self._sample_last_try < 120:
+            return
+        self._sample_last_try = now
+        try:
+            rep = self.ledger.report(sid) or {}
+            if rep.get("gap") or rep.get("partial"):
+                return
+            st = self.ledger.stat(sid)
+            if not st or not st["calls"]:
+                return
+            row = db_query("SELECT COUNT(*) FROM messages WHERE session_id=? "
+                           "AND finish_reason='length'", (sid,), one=True)
+            if not row or row[0]:
+                return
+            cjk, other = self._msg_chars(sid)
+            if cjk + other < 20000:
+                return
+            src = db_query("SELECT source, model FROM sessions WHERE id=?", (sid,), one=True)
+            if not src or src[0] != "desktop":
+                return
+            samples = []
+            try:
+                with open(SAMPLES_PATH, "r", encoding="utf-8-sig") as f:
+                    samples = json.load(f)
+                if not isinstance(samples, list):
+                    samples = []
+            except Exception:
+                samples = []
+            if any(s.get("sid") == sid for s in samples):
+                self._sample_last_sid = sid
+                return
+            samples.append({
+                "sid": sid, "model": src[1], "cjk": cjk, "non_cjk": other,
+                "out_recorded": sum(c["out"] for c in st["calls"]),
+                "ts": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            })
+            tmp = SAMPLES_PATH + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(samples, f, ensure_ascii=False, indent=1)
+            os.replace(tmp, SAMPLES_PATH)
+            self._sample_last_sid = sid
+        except Exception:
+            pass
+
+    # ---------- 组装 ----------
+    def build(self, sid, source="指定"):
+        """组装某会话的完整展示数据（成本 + 子代理 + 缺账）。"""
+        d = self._session_info(sid)
+        d["source"] = source
+        now_hm = datetime.now().strftime("%H:%M")
+
+        entry = self.prices.match(d["site"], d["model"])
+        d["priced"] = compute_cost(entry, d["inp"], d["cr"], d["out"], now_hm)
+        d["price_entry"] = entry
+        d["children"] = self._children_cost(sid, now_hm)
+        calib = self.calib_mgr.get_session_calib(sid) if hasattr(self, "calib_mgr") else None
+        d["calib"] = calib
+        hermes_cost = (d.get("priced") or {}).get("cost") or 0.0
+        calib_offset = None
+        if hasattr(self, "calib_mgr"):
+            calib_offset = self.calib_mgr.get_calibration_offset(sid, hermes_cost, d["cr"], d["inp"])
+        d["calib_offset"] = calib_offset
+
+        rep = self.ledger.report(sid)
+        d["report"] = rep
+        d["estimate"] = self._estimate(sid, d, rep) if rep else None
+        est = d["estimate"]
+        if est:
+            if entry:
+                ec = compute_cost(entry, est["miss"], est["hit"], est["out"], now_hm)
+                est["cost"] = ec["cost"] if ec else None
+            else:
+                est["cost"] = None
+        return d
+
+    # ---------- 后台中转站采集守护 ----------
+    def _start_proxy_daemon(self):
+        """内置中转站采集轮询守护（消灭外部独立 poll_loop 进程）。"""
+        def _loop():
+            time.sleep(10)  # 启动延时，避免抢占启动资源
+            while True:
+                try:
+                    import sys
+                    pm_dir = _get_proxy_monitor_dir()
+                    if pm_dir not in sys.path:
+                        sys.path.insert(0, pm_dir)
+                    import poll_loop
+                    poll_loop.one_round()
+                except Exception:
+                    pass
+                time.sleep(300)
+        t = threading.Thread(target=_loop, daemon=True, name="ProxyPollDaemon")
+        t.start()
+
+    @staticmethod
+    def _is_hermes_focused():
+        """检查前台焦点是否在 Hermes（未聚焦时休眠以降低 UIA 跨进程开销）。"""
+        try:
+            import ctypes
+            hwnd = ctypes.windll.user32.GetForegroundWindow()
+            if not hwnd:
+                return False
+            pid = ctypes.c_ulong()
+            ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            import psutil
+            p = psutil.Process(pid.value)
+            name = (p.name() or "").lower()
+            return ("hermes" in name or "electron" in name or "python" in name)
+        except Exception:
+            return True
+
+    # ---------- 后台跟随线程 ----------
+    def _follow_loop(self):
+        """在后台线程里做「三信号跟随」（UIA 跨进程读要 30~70ms，不能占主线程）。
+
+        抖动抑制：UIA 偶尔会读到别的会话（鼠标悬停侧边栏时那里也有同名按钮）。
+        判据 = 短时间内频繁变更（正常切对话不会 6 秒内变 3 次），
+        命中则临时锁 4 秒，把抖动吃掉；正常切换仍然即时生效（零额外延迟）。
+        """
+        try:                                  # 后台线程需要自己的 COM 环境
+            import comtypes
+            comtypes.CoInitialize()
+        except Exception:
+            pass
+        while True:
+            try:
+                sid = self._read_uia_sid()
+                if not sid:
+                    sid = self._read_latest_task_sid()
+                if not sid:
+                    sid = self._smu_latest()
+                now = time.time()
+                with self._sid_lock:
+                    cur = self._followed_sid
+                    if sid and sid != cur:
+                        self._chg_times = [t for t in self._chg_times if now - t < 6.0]
+                        self._chg_times.append(now)
+                        if len(self._chg_times) >= 3 and now >= self._lock_until:
+                            self._lock_until = now + 4.0     # 判定为抖动 → 锁定
+                        if now < self._lock_until and cur and len(self._chg_times) >= 3:
+                            sid = cur                        # 锁定期内忽略新值
+                        else:
+                            self._followed_sid = sid
+                            self._followed_at = now
+                    else:
+                        self._chg_times = [t for t in self._chg_times if now - t < 6.0]
+            except Exception:
+                pass
+            # 智能降频：若用户当前在全屏游戏/看电影/切在其他软件，休眠延长至 3 秒
+            sleep_sec = 0.7 if self._is_hermes_focused() else 3.0
+            time.sleep(sleep_sec)
+
+    # ---------- 手动刷新（强制重新对齐跟随目标） ----------
+    def refresh_follow(self):
+        """清掉所有锁/限流/缓存，立刻同步重跑一遍三级信号，返回对齐到的 sid。
+
+        「卡住 / 检测不到当前对话」的成因（都在这里被清掉）：
+          ① 抖动锁：切换太快触发 _lock_until → 4 秒内忽略新会话
+          ② UIA 重扫限流：_uia_last_try 未到期时不肯重扫（0.5 秒窗）
+          ③ history 限流：_read_latest_task_sid 3 秒最多探一次，且缓存 cur_sid
+          ④ last_info 5 秒缓存：current() 会直接返回旧数据
+          ⑤ SMU 兜底会指向「最近有 API 调用的会话」，未必是当前打开的那个
+
+        ⚠ 2026-09-22 性能修正（实测数据）：
+          * **不再清 _uia_btn** —— 保留元素缓存时读 Name 只要 **0.1ms**，
+            而清掉后强制全树搜索要 **273~346ms**。这正是「点刷新卡一下」的主因。
+            元素真失效时 _read_uia_sid 自己会检测（读失败/Name 不含关键词）并置 None 重扫，
+            所以保留缓存是安全的。
+          * history 直连改 immutable 后只需 **4~21ms**（原 950ms），
+            所以保留「同步重探三级」的语义，不必改成异步 —— 刷新时能拿到确定的最新值。
+
+        ⚠ 后台跟随线程（每 0.7 秒一趟）会在本方法返回后重新填充这些限流字段，
+        那是正常行为；本方法保证的是「此刻同步重探一次并把目标对准」。
+        """
+        with self._sid_lock:
+            self._chg_times = []
+            self._lock_until = 0.0
+        # 只重置「重扫许可」，不动 _uia_btn（热读路径 0.1ms，见上面说明）
+        self._uia_last_try = 0.0
+        self._hist_last_try = 0.0
+        self.hist_mtime = 0
+        self.cur_sid = None
+        self.last_sid = None
+        self.last_info = None
+        self.last_info_at = 0.0
+
+        hit = None
+        for fn, name in ((self._read_uia_sid, "UIA"),
+                         (self._read_latest_task_sid, "history"),
+                         (self._smu_latest, "SMU")):
+            try:
+                sid = fn()
+            except Exception:
+                sid = None
+            if sid:
+                with self._sid_lock:
+                    self._followed_sid = sid
+                    self._followed_at = time.time()
+                hit = {"sid": sid, "via": name, "at": time.time()}
+                break
+        # 无论成功与否都返回同一结构（避免调用方写 `(hit or {})` 兜底）
+        self.last_refresh = hit or {"sid": None, "via": None, "at": time.time()}
+        if hit:
+            _startup_log("刷新对齐：命中 %s → %s" % (hit["via"], hit["sid"]))
+        else:
+            _startup_log("刷新对齐：三级信号（UIA/history/SMU）都没读到")
+        return self.last_refresh
+
+    def current(self, include_gap=False):
+        self.ledger.poll()
+        with self._sid_lock:
+            sid = self._followed_sid
+        source = "实时跟随"
+        if not sid:
+            sid = self._read_latest_task_sid()
+            source = "切换跟随"
+        if not sid:
+            sid = self._smu_latest()
+            source = "活动跟随"
+        if not sid:
+            return None
+        now = time.time()
+        if (sid == self.last_sid and self.last_info is not None
+                and (now - self.last_info_at) < SITE_INFO_TTL):
+            self.last_info["source"] = source
+            return self.last_info
+
+        d = self.build(sid, source)
+        d["include_gap"] = include_gap
+        self.last_sid = sid
+        self.last_info = d
+        self.last_info_at = now
+        self.collect_sample()
+        return d
+
+
+def _ts_to_epoch(ts):
+    try:
+        return datetime.strptime(ts, "%Y-%m-%d %H:%M:%S").timestamp()
+    except Exception:
+        return 0.0
+
+
+def _ts_delta(a, b):
+    """两个时间戳字符串的秒差（a-b）。"""
+    return _ts_to_epoch(a) - _ts_to_epoch(b)
+
+
+# ─────────────────────────── 价格填写弹窗 ───────────────────────────
+
+class PriceDialog:
+    def __init__(self, root, book, host, model, on_saved=None, entry=None):
+        self.book = book
+        self.host = host or ""
+        self.model = model or ""
+        self.on_saved = on_saved
+        self.entry = entry or {}
+        e = self.entry
+
+        self.win = tk.Toplevel(root)
+        self.win.title("价格配置")
+        self.win.configure(bg=BG)
+        self.win.attributes("-topmost", True)
+        apply_icon(self.win)
+        apply_dark_title_bar(self.win, bg_hex=BG)
+        self.win.resizable(False, False)
+        self.win.transient(root)
+
+        pad = {"padx": 10, "pady": 3}
+        tk.Label(self.win, text="站: %s" % self.host, bg=BG, fg=FG, font=FONT,
+                 anchor="w").grid(row=0, column=0, columnspan=6, sticky="w", **pad)
+        tk.Label(self.win, text="模型: %s" % self.model, bg=BG, fg=DIM, font=FONT_S,
+                 anchor="w").grid(row=1, column=0, columnspan=6, sticky="w", **pad)
+
+        def frm(r):
+            f = tk.Frame(self.win, bg=BG)
+            f.grid(row=r, column=0, columnspan=6, sticky="we", padx=10, pady=2)
+            return f
+
+        # 三价
+        f = frm(2)
+        tk.Label(f, text="输入价", bg=BG, fg=FG, font=FONT).pack(side="left")
+        self.e_in = self._entry(f, e.get("in", ""))
+        tk.Label(f, text="输出价", bg=BG, fg=FG, font=FONT).pack(side="left", padx=(8, 0))
+        self.e_out = self._entry(f, e.get("out", ""))
+        tk.Label(f, text="缓存价", bg=BG, fg=FG, font=FONT).pack(side="left", padx=(8, 0))
+        self.e_cache = self._entry(f, e.get("cache", ""))
+        tk.Label(f, text="元/百万", bg=BG, fg=DIM, font=FONT_S).pack(side="left", padx=(6, 0))
+
+        f = frm(3)
+        self.v_model_wild = tk.BooleanVar(value=(self.model in ("", "*")))
+        tk.Checkbutton(f, text="本站默认（所有模型，模型填 *）", variable=self.v_model_wild,
+                       bg=BG, fg=FG, selectcolor=BG, activebackground=BG,
+                       activeforeground=FG, font=FONT_S,
+                       command=self._toggle_wild).pack(side="left")
+        self.v_free = tk.BooleanVar(value=(e.get("tag") == "免费"))
+        tk.Checkbutton(f, text="免费站（全按 0 算，显示「免费」）", variable=self.v_free,
+                       bg=BG, fg=FG, selectcolor=BG, activebackground=BG,
+                       activeforeground=FG, font=FONT_S).pack(side="left", padx=(10, 0))
+        tk.Label(f, text="  倍率", bg=BG, fg=FG, font=FONT).pack(side="left")
+        self.e_ratio = self._entry(f, e.get("ratio", ""), w=6)
+        tk.Label(f, text="(标价×倍率=实收，留空=沿用原倍率)", bg=BG, fg=DIM, font=FONT_S).pack(
+            side="left", padx=(3, 0))
+        for _w in (self.e_ratio, self.e_in, self.e_out, self.e_cache):
+            _w.bind("<KeyRelease>", lambda _e: self._preview())
+
+        # 峰谷
+        f = frm(4)
+        self.v_peak = tk.BooleanVar(value=bool(e.get("peak") or e.get("off")))
+        tk.Checkbutton(f, text="⚡ 峰谷价", variable=self.v_peak, bg=BG, fg=FG,
+                       selectcolor=BG, activebackground=BG, activeforeground=FG,
+                       font=FONT_S, command=self._toggle_peak).pack(side="left")
+
+        f = frm(5)
+        tk.Label(f, text="峰价时段1", bg=BG, fg=FG, font=FONT_S).pack(side="left")
+        self.e_p1s = self._entry(f, "", w=7)
+        tk.Label(f, text="—", bg=BG, fg=DIM, font=FONT_S).pack(side="left", padx=2)
+        self.e_p1e = self._entry(f, "", w=7)
+        tk.Label(f, text="  时段2", bg=BG, fg=FG, font=FONT_S).pack(side="left")
+        self.e_p2s = self._entry(f, "", w=7)
+        tk.Label(f, text="—", bg=BG, fg=DIM, font=FONT_S).pack(side="left", padx=2)
+        self.e_p2e = self._entry(f, "", w=7)
+
+        f = frm(6)
+        tk.Label(f, text="谷价时段", bg=BG, fg=DIM, font=FONT_S).pack(side="left")
+        self.lbl_off_range = tk.Label(f, text="—", bg=BG, fg=DIM, font=FONT_S)
+        self.lbl_off_range.pack(side="left", padx=(4, 0))
+
+        f = frm(7)
+        tk.Label(f, text="峰价", bg=BG, fg=FG, font=FONT_S).pack(side="left")
+        self.e_pk_in = self._entry(f, "", w=6)
+        self.e_pk_out = self._entry(f, "", w=6)
+        self.e_pk_cache = self._entry(f, "", w=6)
+        tk.Button(f, text="谷 = 峰 × 50%", command=self._fill_half, bg="#2a2a30",
+                  fg=FG, activebackground="#333", activeforeground=FG, bd=0,
+                  font=FONT_S).pack(side="left", padx=(8, 0))
+
+        f = frm(8)
+        tk.Label(f, text="谷价", bg=BG, fg=FG, font=FONT_S).pack(side="left")
+        self.e_of_in = self._entry(f, "", w=6)
+        self.e_of_out = self._entry(f, "", w=6)
+        self.e_of_cache = self._entry(f, "", w=6)
+
+        self.lbl_msg = tk.Label(self.win, text="", bg=BG, fg=YELLOW, font=FONT_S,
+                                anchor="w", justify="left", wraplength=380)
+        self.lbl_msg.grid(row=9, column=0, columnspan=6, sticky="w", padx=10, pady=(4, 0))
+
+        f = tk.Frame(self.win, bg=BG)
+        f.grid(row=10, column=0, columnspan=6, sticky="e", padx=10, pady=(4, 10))
+        tk.Button(f, text="保存", command=self.save, bg="#2f5d3a", fg=FG, bd=0,
+                  activebackground="#3a7248", activeforeground=FG, font=FONT,
+                  width=8).pack(side="left", padx=4)
+        tk.Button(f, text="取消", command=self.win.destroy, bg="#2a2a30", fg=FG, bd=0,
+                  activebackground="#333", activeforeground=FG, font=FONT,
+                  width=8).pack(side="left")
+
+        # 回填峰谷值
+        pk = e.get("peak") or {}
+        of = e.get("off") or {}
+        ph = e.get("peak_hours") or []
+        if len(ph) > 0 and ph[0]:
+            self.e_p1s.insert(0, ph[0][0] or "")
+            self.e_p1e.insert(0, ph[0][1] or "")
+        if len(ph) > 1 and ph[1]:
+            self.e_p2s.insert(0, ph[1][0] or "")
+            self.e_p2e.insert(0, ph[1][1] or "")
+        for w, v in ((self.e_pk_in, pk.get("in")), (self.e_pk_out, pk.get("out")),
+                     (self.e_pk_cache, pk.get("cache")), (self.e_of_in, of.get("in")),
+                     (self.e_of_out, of.get("out")), (self.e_of_cache, of.get("cache"))):
+            if v is not None:
+                w.insert(0, str(v))
+        # ── 价格段（时间轴）：同一站/模型可按日期改价，历史段不动 ──
+        f = tk.Frame(self.win, bg=BG)
+        f.grid(row=11, column=0, columnspan=6, sticky="we", padx=10, pady=(0, 10))
+        tk.Label(f, text="价格段", bg=BG, fg=FG, font=FONT_S).pack(side="left")
+        tk.Button(f, text="◀", command=self.seg_prev, bg="#2a2a30", fg=FG, bd=0,
+                  activebackground="#333", activeforeground=FG, font=FONT_S,
+                  width=2).pack(side="left", padx=(4, 0))
+        self.lbl_seg = tk.Label(f, text="", bg=BG, fg=YELLOW, font=FONT_S, width=24,
+                                anchor="w")
+        self.lbl_seg.pack(side="left", padx=4)
+        tk.Button(f, text="▶", command=self.seg_next, bg="#2a2a30", fg=FG, bd=0,
+                  activebackground="#333", activeforeground=FG, font=FONT_S,
+                  width=2).pack(side="left")
+        tk.Label(f, text=" 新生效日", bg=BG, fg=DIM, font=FONT_S).pack(side="left")
+        self.e_seg_from = self._entry(f, "", w=11)
+        tk.Button(f, text="＋新增段", command=self.seg_add, bg="#2a2a30", fg=FG, bd=0,
+                  activebackground="#333", activeforeground=FG,
+                  font=FONT_S).pack(side="left", padx=3)
+        tk.Button(f, text="删除本段", command=self.seg_del, bg="#2a2a30", fg=FG, bd=0,
+                  activebackground="#333", activeforeground=FG,
+                  font=FONT_S).pack(side="left")
+
+        self._toggle_peak()
+        self._toggle_wild()
+        self._init_segs()
+        self.win.grab_set()
+
+    # ---------- 价格段（时间轴）编辑 ----------
+    def _init_segs(self):
+        """把条目规整成工作副本 self._segs（列表），并载入第一段。"""
+        ps = self.book.segs(self.entry)
+        if ps:
+            self._segs = [dict(p) for p in ps]
+        else:
+            e = self.entry or {}
+            seg = {}
+            for k in ("in", "out", "cache", "ratio", "peak", "off", "peak_hours",
+                      "weekend_off", "tag"):
+                if k in e:
+                    seg[k] = e[k]
+            self._segs = [seg]
+        self._load_seg(0)
+
+    def _put(self, w, v):
+        w.delete(0, "end")
+        if v not in (None, ""):
+            w.insert(0, str(v))
+
+    def _load_seg(self, idx):
+        self._seg_idx = max(0, min(idx, len(self._segs) - 1))
+        s = self._segs[self._seg_idx] or {}
+        self._put(self.e_in, s.get("in"))
+        self._put(self.e_out, s.get("out"))
+        self._put(self.e_cache, s.get("cache"))
+        self._put(self.e_ratio, s.get("ratio"))
+        self.v_free.set(s.get("tag") == "免费")
+        is_peak = bool(s.get("peak") or s.get("off"))
+        self.v_peak.set(is_peak)
+        ph = s.get("peak_hours") or []
+        self._put(self.e_p1s, ph[0][0] if len(ph) > 0 and ph[0] else "")
+        self._put(self.e_p1e, ph[0][1] if len(ph) > 0 and ph[0] else "")
+        self._put(self.e_p2s, ph[1][0] if len(ph) > 1 and ph[1] else "")
+        self._put(self.e_p2e, ph[1][1] if len(ph) > 1 and ph[1] else "")
+        pk = s.get("peak") or {}
+        of = s.get("off") or {}
+        self._put(self.e_pk_in, pk.get("in"))
+        self._put(self.e_pk_out, pk.get("out"))
+        self._put(self.e_pk_cache, pk.get("cache"))
+        self._put(self.e_of_in, of.get("in"))
+        self._put(self.e_of_out, of.get("out"))
+        self._put(self.e_of_cache, of.get("cache"))
+        self._toggle_peak()
+        self._refresh_seg_label()
+
+    def _stash_seg(self):
+        """把输入框当前值存回当前段（宽松存，严格校验留到 save）。"""
+        if not getattr(self, "_segs", None):
+            return
+        s = dict(self._segs[self._seg_idx] or {})
+        s["in"] = self.e_in.get().strip()
+        s["out"] = self.e_out.get().strip()
+        s["cache"] = self.e_cache.get().strip()
+        r = self.e_ratio.get().strip()
+        if r == "":
+            s.pop("ratio", None)
+        else:
+            s["ratio"] = r
+        if self.v_free.get():
+            s["tag"] = "免费"
+        else:
+            s.pop("tag", None)
+        if self.v_peak.get():
+            try:
+                segs = self._segments()
+            except Exception:
+                segs = s.get("peak_hours") or []
+            if segs:
+                s["peak_hours"] = segs
+            s["peak"] = {"in": self.e_pk_in.get().strip(), "out": self.e_pk_out.get().strip(),
+                         "cache": self.e_pk_cache.get().strip()}
+            s["off"] = {"in": self.e_of_in.get().strip(), "out": self.e_of_out.get().strip(),
+                        "cache": self.e_of_cache.get().strip()}
+        else:
+            for k in ("peak", "off", "peak_hours"):
+                s.pop(k, None)
+        self._segs[self._seg_idx] = s
+
+    def _refresh_seg_label(self):
+        s = self._segs[self._seg_idx] if self._segs else {}
+        self.lbl_seg.config(text="第 %d/%d 段 · %s 起" % (
+            self._seg_idx + 1, len(self._segs), s.get("from") or "(最早)"))
+
+    def seg_prev(self):
+        if self._seg_idx > 0:
+            self._stash_seg()
+            self._load_seg(self._seg_idx - 1)
+
+    def seg_next(self):
+        if self._seg_idx < len(self._segs) - 1:
+            self._stash_seg()
+            self._load_seg(self._seg_idx + 1)
+
+    def seg_add(self):
+        d = self.e_seg_from.get().strip()
+        if not re.match(r"^\d{4}-\d{2}-\d{2}$", d):
+            self.lbl_msg.config(text="⚠ 新生效日填 YYYY-MM-DD（如 2026-08-17）", fg=RED)
+            return
+        if any((s.get("from") or "") == d for s in self._segs):
+            self.lbl_msg.config(text="⚠ 该生效日已存在", fg=RED)
+            return
+        self._stash_seg()
+        cur = dict(self._segs[self._seg_idx])
+        cur["from"] = d
+        cur.pop("ratio_kept", None)
+        self._segs.append(cur)
+        self._segs.sort(key=lambda x: x.get("from") or "")
+        idx = [i for i, s in enumerate(self._segs) if (s.get("from") or "") == d]
+        self._load_seg(idx[0] if idx else 0)
+        self.e_seg_from.delete(0, "end")
+        self.lbl_msg.config(text="已新增价格段 %s（改好价后点保存）" % d, fg=GREEN)
+
+    def seg_del(self):
+        if len(self._segs) <= 1:
+            self.lbl_msg.config(text="⚠ 至少要留一段", fg=RED)
+            return
+        name = self._segs[self._seg_idx].get("from") or "(最早)"
+        if not messagebox.askyesno("删除价格段", "删除「%s 起」这一段？" % name, parent=self.win):
+            return
+        i = self._seg_idx
+        self._segs.pop(i)
+        self._load_seg(min(i, len(self._segs) - 1))
+        self.lbl_msg.config(text="已删除一段（点保存才生效）", fg=YELLOW)
+
+    def _entry(self, parent, val="", w=8):
+        e = tk.Entry(parent, width=w, font=FONT, bg="#26262c", fg=FG,
+                     insertbackground=FG, bd=0, highlightthickness=1,
+                     highlightbackground="#3a3a42", highlightcolor=BLUE)
+        if val != "" and val is not None:
+            e.insert(0, str(val))
+        e.pack(side="left", padx=2)
+        return e
+
+    def _toggle_wild(self):
+        if self.v_model_wild.get():
+            pass
+
+    def _preview(self):
+        """倍率预览：标价 × 倍率 = 实收。"""
+        def v(w):
+            try:
+                return float(w.get().strip() or 0)
+            except ValueError:
+                return None
+        try:
+            r = float(self.e_ratio.get().strip() or 1.0)
+        except ValueError:
+            r = None
+        if r is None or r <= 0:
+            self.lbl_msg.config(text="倍率要填正数（默认 1，不填=不变）", fg=RED)
+            return
+        if abs(r - 1.0) < 1e-9:
+            self.lbl_msg.config(text="", fg=YELLOW)
+            return
+        parts = []
+        for name, w in (("输入", self.e_in), ("输出", self.e_out), ("缓存", self.e_cache)):
+            x = v(w)
+            if x:
+                parts.append("%s %.4g→%.4g" % (name, x, x * r))
+        self.lbl_msg.config(
+            text="倍率 ×%.4g ｜ %s" % (r, " ｜ ".join(parts)) if parts
+            else "倍率 ×%.4g" % r, fg=BLUE)
+
+    def _toggle_peak(self):
+        state = "normal" if self.v_peak.get() else "disabled"
+        for w in (self.e_p1s, self.e_p1e, self.e_p2s, self.e_p2e, self.e_pk_in,
+                  self.e_pk_out, self.e_pk_cache, self.e_of_in, self.e_of_out,
+                  self.e_of_cache):
+            w.config(state=state)
+        self._refresh_off_range()
+
+    def _fill_half(self):
+        try:
+            for src, dst in ((self.e_pk_in, self.e_of_in), (self.e_pk_out, self.e_of_out),
+                             (self.e_pk_cache, self.e_of_cache)):
+                v = float(src.get() or 0) / 2.0
+                dst.delete(0, "end")
+                dst.insert(0, ("%g" % v))
+        except Exception:
+            pass
+
+    def _segments(self):
+        segs = []
+        for s, e in ((self.e_p1s.get().strip(), self.e_p1e.get().strip()),
+                     (self.e_p2s.get().strip(), self.e_p2e.get().strip())):
+            if s and e and s != e:
+                segs.append([s, e])
+        return segs
+
+    def _refresh_off_range(self):
+        if not self.v_peak.get():
+            self.lbl_off_range.config(text="—")
+            return
+        segs = self._segments()
+        if not segs:
+            self.lbl_off_range.config(text="全天谷价")
+            return
+        def hm2m(x):
+            h, m = x.split(":")
+            return int(h) * 60 + int(m)
+        taken = []
+        for s, e in segs:
+            a, b = hm2m(s), hm2m(e)
+            if a <= b:
+                taken += [(a, b)]
+            else:
+                taken += [(a, 1440), (0, b)]
+        taken.sort()
+        free = []
+        cur = 0
+        for a, b in taken:
+            if a > cur:
+                free += [(cur, a)]
+            cur = max(cur, b)
+        if cur < 1440:
+            free += [(cur, 1440)]
+        txt = " · ".join("%02d:%02d-%02d:%02d" % (a // 60, a % 60, b // 60, b % 60)
+                         for a, b in free) or "全天谷价"
+        self.lbl_off_range.config(text=txt)
+
+    def save(self):
+        """保存：把工作副本里的**所有价格段**写回条目。
+
+        单段且无生效日 → 保持旧格式（兼容老条目）；多段或带生效日 → 写 periods 时间轴。
+        """
+        def num(v):
+            s = str(v if v is not None else "").strip()
+            return 0.0 if s == "" else float(s)
+
+        try:
+            self._stash_seg()             # 当前编辑的段先落回工作副本
+            old_r = 0.0
+            try:
+                old_r = float(self.entry.get("ratio") or 0)
+            except (TypeError, ValueError):
+                old_r = 0.0
+            raw_r = self.e_ratio.get().strip()
+            periods = []
+            for i, s in enumerate(self._segs):
+                free = (s.get("tag") == "免费")
+                pin, pout, pcache = num(s.get("in")), num(s.get("out")), num(s.get("cache"))
+                if free:
+                    pin = pout = pcache = 0.0
+                rr = s.get("ratio")
+                if rr in (None, ""):
+                    # 留空 = 沿用原倍率（仅原条目所在段有旧值可沿用），否则 1.0
+                    if i == self._seg_idx and raw_r == "" and old_r and abs(old_r - 1.0) > 1e-9:
+                        ratio = old_r
+                    else:
+                        ratio = 1.0
+                else:
+                    try:
+                        ratio = float(rr)
+                    except (TypeError, ValueError):
+                        raise ValueError("倍率填数字（默认 1，留空=沿用原倍率）")
+                if ratio <= 0:
+                    raise ValueError("倍率要大于 0")
+                seg = {"from": s.get("from") or "",
+                       "in": pin, "out": pout, "cache": pcache}
+                if abs(ratio - 1.0) > 1e-9:
+                    seg["ratio"] = ratio
+                elif raw_r != "" and i == self._seg_idx and old_r and abs(old_r - 1.0) > 1e-9:
+                    seg["ratio"] = 1.0    # 明确填了 1 → 显式清零
+                if free:
+                    seg["tag"] = "免费"
+                pk, of = s.get("peak") or {}, s.get("off") or {}
+                if pk or of:
+                    segs_hm = s.get("peak_hours") or []
+                    if not segs_hm:
+                        raise ValueError("峰谷价需要至少一段有效时段")
+                    for a, b in segs_hm:
+                        self._check_hm(a)
+                        self._check_hm(b)
+                    if len(segs_hm) == 2 and self._overlap(segs_hm[0], segs_hm[1]):
+                        raise ValueError("两段峰价时段重叠了")
+                    if cover_all_day(segs_hm):
+                        if not messagebox.askyesno(
+                                "确认", "「%s」段的两段峰价已覆盖全天，没有谷价时段了，确认保存？"
+                                % (s.get("from") or "最早")):
+                            return
+                    seg["peak_hours"] = segs_hm
+                    seg["peak"] = {k: num(pk.get(k)) for k in ("in", "out", "cache")}
+                    seg["off"] = {k: num(of.get(k)) for k in ("in", "out", "cache")}
+                if s.get("weekend_off"):
+                    seg["weekend_off"] = True
+                periods.append(seg)
+            periods.sort(key=lambda x: x.get("from") or "")
+            rec = {
+                "host": self.host,
+                "model": "*" if (self.v_model_wild.get() or not self.model) else self.model,
+                "cur": self.entry.get("cur") or "¥",
+                "updated": datetime.now().strftime("%Y-%m-%d"),
+            }
+            if len(periods) > 1 or (periods and periods[0].get("from")):
+                rec["periods"] = periods              # 时间轴格式
+            else:
+                one = dict(periods[0]) if periods else {}
+                one.pop("from", None)
+                rec.update(one)                       # 单段无日期 → 旧格式
+            self.book.upsert(rec)
+        except Exception as ex:
+            self.lbl_msg.config(text="⚠ %s" % ex)
+            return
+        self.win.destroy()
+        if self.on_saved:
+            self.on_saved()
+
+    @staticmethod
+    def _check_hm(x):
+        if not re.match(r"^\d{1,2}:\d{2}$", x):
+            raise ValueError("时间格式应为 HH:MM（如 08:30）")
+
+    @staticmethod
+    def _overlap(a, b):
+        def hm2m(x):
+            h, m = x.split(":")
+            return int(h) * 60 + int(m)
+        def seg(x):
+            s, e = hm2m(x[0]), hm2m(x[1])
+            if s <= e:
+                return [(s, e)]
+            return [(s, 1440), (0, e)]
+        for s1, e1 in seg(a):
+            for s2, e2 in seg(b):
+                if max(s1, s2) < min(e1, e2):
+                    return True
+        return False
+
+
+# ─────────────────────────── 价格表管理窗口 ───────────────────────────
+
+class PriceManager:
+    def __init__(self, root, book, on_changed=None, cur_host=None, cur_model=None):
+        self.book = book
+        self.on_changed = on_changed
+        self.cur_host = cur_host or ""
+        self.cur_model = cur_model or ""
+        self.root = root
+
+        self.win = tk.Toplevel(root)
+        self.win.title("价格表管理")
+        self.win.configure(bg=BG)
+        self.win.attributes("-topmost", True)
+        apply_icon(self.win)
+        apply_dark_title_bar(self.win, bg_hex=BG)
+        self.win.geometry("640x360")
+
+        cols = ("host", "model", "in", "out", "cache", "peak", "updated")
+        heads = ("站", "模型", "输入", "输出", "缓存", "峰谷", "更新")
+        self.tree = ttk.Treeview(self.win, columns=cols, show="headings", height=12)
+        for c, h in zip(cols, heads):
+            self.tree.heading(c, text=h)
+            self.tree.column(c, width=90 if c != "host" else 170, anchor="w")
+        self.tree.pack(fill="both", expand=True, padx=10, pady=(10, 4))
+        self.tree.bind("<Double-1>", lambda e: self.edit())
+        self.tree.bind("<Button-3>", self._popup)
+
+        f = tk.Frame(self.win, bg=BG)
+        f.pack(fill="x", padx=10, pady=(0, 10))
+        for text, cmd in (("新建当前站", self.new_current), ("编辑", self.edit),
+                          ("删除", self.delete), ("刷新", self.refresh)):
+            tk.Button(f, text=text, command=cmd, bg="#2a2a30", fg=FG, bd=0,
+                      activebackground="#333", activeforeground=FG,
+                      font=FONT).pack(side="left", padx=3)
+        tk.Button(f, text="⚡ 从中转站实扣同步价格", command=self.sync_from_proxy,
+                  bg="#2f5d3a", fg=FG, bd=0, activebackground="#3a7248",
+                  activeforeground=FG, font=FONT).pack(side="right", padx=3)
+
+        self.menu = tk.Menu(self.win, tearoff=0)
+        self.menu.add_command(label="编辑", command=self.edit)
+        self.menu.add_command(label="删除", command=self.delete)
+        self.refresh()
+
+    def sync_from_proxy(self):
+        ok, msg = sync_prices_from_proxy(self.book)
+        self.refresh()
+        if self.on_changed:
+            self.on_changed()
+        try:
+            import tkinter.messagebox as mb
+            if ok:
+                mb.showinfo("同步结果", msg)
+            else:
+                mb.showwarning("同步提示", msg)
+        except Exception:
+            pass
+
+    def refresh(self):
+        for i in self.tree.get_children():
+            self.tree.delete(i)
+        for e in self.book.all():
+            pk = ""
+            if e.get("peak") or e.get("off"):
+                segs = e.get("peak_hours") or []
+                pk = "峰谷 " + " ".join("%s-%s" % (s, t) for s, t in segs)
+            elif e.get("tag"):
+                pk = e["tag"]
+            self.tree.insert("", "end", values=(
+                e.get("host", ""), e.get("model", ""), e.get("in", ""), e.get("out", ""),
+                e.get("cache", ""), pk, e.get("updated", "")))
+
+    def _sel_entry(self):
+        sel = self.tree.selection()
+        if not sel:
+            return None
+        vals = self.tree.item(sel[0], "values")
+        for e in self.book.all():
+            if e.get("host") == vals[0] and str(e.get("model", "")) == str(vals[1]):
+                return e
+        return None
+
+    def _popup(self, event):
+        row = self.tree.identify_row(event.y)
+        if row:
+            self.tree.selection_set(row)
+            self.menu.tk_popup(event.x_root, event.y_root)
+
+    def new_current(self):
+        if not self.cur_host:
+            return
+        PriceDialog(self.win, self.book, self.cur_host, self.cur_model,
+                    on_saved=self._changed)
+        self.win.after(400, self.refresh)
+
+    def edit(self):
+        e = self._sel_entry()
+        if not e:
+            return
+        PriceDialog(self.win, self.book, e.get("host", ""),
+                    "*" if e.get("model") in ("*", "", None) else e.get("model", ""),
+                    on_saved=self._changed, entry=e)
+        self.win.after(400, self.refresh)
+
+    def delete(self):
+        e = self._sel_entry()
+        if not e:
+            return
+        if not messagebox.askyesno("删除", "删除条目 %s / %s ？" % (e.get("host"), e.get("model"))):
+            return
+        try:
+            self.book.delete(e.get("host"), e.get("model"))
+        except Exception as ex:
+            messagebox.showerror("删除失败", str(ex), parent=self.win)
+            return
+        self._changed()
+
+    def _changed(self):
+        self.refresh()
+        if self.on_changed:
+            self.on_changed()
+
+
+# ─────────────────────────── 日账本（跨站成本统计） ───────────────────────────
+
+
+class CostLedger:
+    """日账本：每天结算一次各站×模型的消费（水位差值法）+ 价格冻结。
+
+    水位差值 = 今日 DB 累计 − 上次结算时的 DB 累计。
+    因为差值天然规避"跨天会话"的归属问题，所以比按 last_seen 切分更准。
+    结算时把「当时算出的成本（含当时倍率）」一起写死 → 日后改价不污染历史。
+    """
+
+    def __init__(self, path=None, prices=None):
+        self.path = path or LEDGER_PATH
+        self.prices = prices
+        self.data = {"days": {}, "approx": [], "bills": [],
+                     "watermark": {"ts": None, "day": None, "keys": {}}}
+        # 非空 = 「文件在、但读不了」→ 禁止写盘（否则 60 秒内 maybe_settle 就会覆盖掉全部历史）
+        self._load_error = ""
+        self.load()
+
+    # ---------- 存取 ----------
+    def load(self):
+        """读账本。
+
+        ⚠ 与 PriceBook 同理：文件不存在 ≠ 读失败。
+        读失败时必须保留内存数据并禁止写盘 —— 否则 tick 每 60 秒调一次 maybe_settle，
+        会立刻用空账本覆盖掉全部历史账目（实测复现）。
+        """
+        self._load_error = ""
+        try:
+            with open(self.path, "r", encoding="utf-8-sig") as f:
+                d = json.load(f)
+        except FileNotFoundError:
+            pass                        # 首次运行 → 空账本，正常
+        except OSError as ex:
+            self._load_error = "账本被占用：%s" % ex
+            return
+        except ValueError as ex:
+            self._load_error = "账本 JSON 损坏：%s" % ex
+            return
+        else:
+            if isinstance(d, dict) and "days" in d:
+                self.data = d
+        self.data.setdefault("days", {})
+        self.data.setdefault("approx", [])
+        self.data.setdefault("bills", [])
+        self.data.setdefault("watermark", {"ts": None, "day": None, "keys": {}})
+
+    def save(self):
+        """原子写账本。读失败时拒绝写盘（返回 False），避免覆盖能救回的数据。"""
+        if self._load_error:
+            _startup_log("账本保存被拒（%s）" % self._load_error)
+            return False
+        if not self.path:
+            # 路径解析失败（如环境变量缺失导致的异常启动）→ 别去 replace("" ) 报 WinError 3
+            _startup_log("账本保存被拒：数据目录未解析出来")
+            return False
+        try:
+            tmp = self.path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self.data, f, ensure_ascii=False, indent=1)
+            os.replace(tmp, self.path)
+            return True
+        except Exception as ex:
+            _startup_log("账本保存失败：%s" % ex)
+            return False
+
+    # ---------- 水位 ----------
+    @staticmethod
+    def _watermark():
+        """DB 全量累计水位：{"host|model": {calls,in,hit,out}}"""
+        out = {}
+        for host, model, calls, inp, hit, o in db_query(
+                "SELECT billing_base_url, model, COALESCE(SUM(api_call_count),0), "
+                "COALESCE(SUM(input_tokens),0), COALESCE(SUM(cache_read_tokens),0), "
+                "COALESCE(SUM(output_tokens),0) FROM session_model_usage "
+                "GROUP BY billing_base_url, model"):
+            h = host or "?"
+            try:
+                h = canon_host(urlparse(host).hostname or h)
+            except Exception:
+                pass
+            key = "%s|%s" % (h, model)
+            k = out.setdefault(key, {"calls": 0, "in": 0, "hit": 0, "out": 0})
+            k["calls"] += calls or 0
+            k["in"] += inp or 0
+            k["hit"] += hit or 0
+            k["out"] += o or 0
+        return out
+
+    def _price_cost(self, host, model, d, day=None, now_hm=None):
+        """按 *day* 生效的价格段算成本。返回 (cost, ratio, seg_from)。"""
+        entry = self.prices.match(host, model, day) if self.prices else None
+        c = compute_cost(entry, d.get("in", 0), d.get("hit", 0), d.get("out", 0),
+                         now_hm=now_hm, day=day)
+        if not c:
+            return None, None, ""
+        return round(c["cost"], 6), c["ratio"], c.get("seg_from") or ""
+
+    # ---------- 重算历史（账本价格冻结的出口） ----------
+    def _settle_hm(self):
+        """结算时刻的 HH:MM（重建当时峰谷判断用的时段）。无水位 → None（用当前钟点）。"""
+        ts = (self.data.get("watermark") or {}).get("ts")
+        try:
+            return datetime.fromtimestamp(float(ts)).strftime("%H:%M")
+        except (TypeError, ValueError):
+            return None
+
+    def recompute(self, mode="day"):
+        """按价格表的时间轴重算账本历史成本（tokens 原样保留）。
+
+        价格段带生效日期后，「重算」不再等于「用今天的价覆盖历史」：
+          mode="day"     ★默认：每一天按「当天生效的价格段」算 → 历史稳定，不受未来调价影响
+          mode="missing"  只补 cost=None 的条目（其余一律不动），同样按当天段
+          mode="all"      一律用「当前生效段」覆盖（价格整段填错时才用，会改写历史）
+        返回 dict(scanned, priced, unpriced, skipped, changed, mode, hm)
+        """
+        days = self.data.get("days") or {}
+        hm = self._settle_hm()
+        scanned = priced = unpriced = skipped = changed = 0
+        for day, rec in days.items():
+            if not isinstance(rec, dict):
+                continue
+            for key, v in rec.items():
+                if not isinstance(v, dict):
+                    continue
+                try:
+                    host, model = key.split("|", 1)
+                    host = canon_host(host)
+                except ValueError:
+                    continue
+                if mode == "missing" and v.get("cost") is not None:
+                    skipped += 1
+                    continue
+                scanned += 1
+                day_arg = None if mode == "all" else day
+                cost, ratio, seg = self._price_cost(
+                    host, model,
+                    {"in": v.get("in") or 0, "hit": v.get("hit") or 0, "out": v.get("out") or 0},
+                    day=day_arg, now_hm=hm)
+                old = v.get("cost")
+                if cost is None:
+                    v["cost"] = None
+                    unpriced += 1
+                else:
+                    v["cost"] = cost
+                    if ratio is not None:
+                        v["ratio"] = ratio
+                    if seg:
+                        v["seg_from"] = seg
+                    priced += 1
+                if (old is None) != (cost is None) or (
+                        old is not None and cost is not None and abs(old - cost) > 1e-9):
+                    changed += 1
+        self.data["recomputed_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self.data["recompute_stat"] = {"scanned": scanned, "priced": priced,
+                                       "unpriced": unpriced, "skipped": skipped,
+                                       "changed": changed, "mode": mode, "hm": hm}
+        self.save()
+        return dict(self.data["recompute_stat"])
+
+    # ---------- 实付锚点（站方账单 → 校准历史 / 反推倍率） ----------
+    def add_bill(self, bill):
+        """录入一条实付锚点（同 host+model+时间段 → 覆盖）。"""
+        b = {
+            "host": bill.get("host") or "",
+            "model": bill.get("model") or "*",
+            "seg_from": bill.get("seg_from") or "",
+            "from": bill.get("from") or "",
+            "to": bill.get("to") or "",
+            "amount": float(bill.get("amount") or 0),
+            "cur": bill.get("cur") or "¥",
+            "tokens": bill.get("tokens") or {},
+            "tokens_by_seg": bill.get("tokens_by_seg") or {},
+            "amount_items": bill.get("amount_items") or {},
+            "note": bill.get("note") or "",
+            "added": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        }
+        rest = [x for x in (self.data.get("bills") or [])
+                if not (x.get("host") == b["host"] and x.get("model") == b["model"]
+                        and x.get("from") == b["from"] and x.get("to") == b["to"])]
+        rest.append(b)
+        rest.sort(key=lambda x: (x.get("host") or "", x.get("from") or ""))
+        self.data["bills"] = rest
+        self.save()
+        return b
+
+    def del_bill(self, host, model, frm, to):
+        rest = [x for x in (self.data.get("bills") or [])
+                if not (x.get("host") == host and x.get("model") == model
+                        and x.get("from") == frm and x.get("to") == to)]
+        self.data["bills"] = rest
+        self.save()
+        return len(rest)
+
+    def _bill_tokens(self, bill):
+        """该账单覆盖的 token：站方给了就用站方，否则按时间段从账本聚合。"""
+        by = bill.get("tokens_by_seg") or {}
+        if by:
+            m = c = o = 0.0
+            for t in by.values():
+                m += float((t or {}).get("miss") or 0)
+                c += float((t or {}).get("cache") or 0)
+                o += float((t or {}).get("out") or 0)
+            return m, c, o, "站方(分段)"
+        t = bill.get("tokens") or {}
+        if t:
+            return (float(t.get("miss") or 0), float(t.get("cache") or 0),
+                    float(t.get("out") or 0), "站方")
+        miss = cache = out = 0.0
+        host = bill.get("host") or ""
+        frm, to = bill.get("from") or "", bill.get("to") or ""
+        for day, rec in (self.data.get("days") or {}).items():
+            if frm and day < frm:
+                continue
+            if to and day > to:
+                continue
+            for key, v in rec.items():
+                if not isinstance(v, dict) or key.split("|", 1)[0] != host:
+                    continue
+                miss += v.get("in") or 0
+                cache += v.get("hit") or 0
+                out += v.get("out") or 0
+        return miss, cache, out, "账本"
+
+    def _resolve_single(self, host, model, seg_from, tokens, amount, amount_items=None, cur="¥"):
+        """单段反解：按该段标价算估算额，与实付/分项金额对比。
+
+        seg_from="" 表示「最早那段」（不能写成 None —— None = 当前生效段）。
+        """
+        entry = (self.prices.match(host, model or "", seg_from)
+                 if self.prices else None)
+        miss = float((tokens or {}).get("miss") or 0)
+        cache = float((tokens or {}).get("cache") or 0)
+        out = float((tokens or {}).get("out") or 0)
+        pin = float((entry or {}).get("in") or 0)
+        pc = float((entry or {}).get("cache") or 0)
+        po = float((entry or {}).get("out") or 0)
+        toks = {"miss": miss, "cache": cache, "out": out}
+        prices = {"miss": pin, "cache": pc, "out": po}
+        labels = {"miss": "未命中输入", "cache": "缓存命中", "out": "输出"}
+        ai = amount_items or {}
+        est_items = {k: toks[k] * prices[k] / 1e6 for k in toks}
+        est = sum(est_items.values())
+        items = []
+        for k in ("miss", "cache", "out"):
+            amt = float(ai.get(k) or 0) if ai else None
+            items.append({
+                "key": k, "label": labels[k], "tokens": toks[k], "price": prices[k],
+                "est": est_items[k], "amount": amt,
+                "unit": (amt / (toks[k] / 1e6)) if (amt is not None and toks[k]) else None,
+                "k": (amt / est_items[k]) if (amt is not None and est_items[k]) else None,
+            })
+        return {"entry": entry, "seg_from": (entry or {}).get("_seg_from", seg_from or ""),
+                "tokens": toks, "prices": prices, "est_items": est_items, "est": est,
+                "amount": amount, "cur": cur, "items": items,
+                "k": (amount / est) if est else None}
+
+    def resolve_bill(self, bill):
+        """反解账单：整体倍率 k、逐项倍率、真单价。支持 tokens_by_seg（跨调价段精确估算）。"""
+        host = bill.get("host")
+        model = bill.get("model") or ""
+        cur = bill.get("cur") or "¥"
+        amount = float(bill.get("amount") or 0)
+        by = bill.get("tokens_by_seg") or {}
+        if by:
+            parts = []
+            for seg_from, t in sorted(by.items(), key=lambda kv: kv[0] or ""):
+                parts.append(self._resolve_single(host, model, seg_from, t, 0.0, None, cur))
+            total_est = sum(p["est"] for p in parts)
+            for p in parts:
+                p["amount_share"] = (amount * p["est"] / total_est) if total_est else 0.0
+                p["k_share"] = (p["amount_share"] / p["est"]) if p["est"] else None
+            toks = {k: sum(p["tokens"][k] for p in parts) for k in ("miss", "cache", "out")}
+            est_items = {k: sum(p["est_items"][k] for p in parts) for k in ("miss", "cache", "out")}
+            items = []
+            for k in ("miss", "cache", "out"):
+                items.append({"key": k, "label": {"miss": "未命中输入", "cache": "缓存命中",
+                                                  "out": "输出"}[k],
+                              "tokens": toks[k], "price": None, "est": est_items[k],
+                              "amount": None, "unit": None, "k": None})
+            return {"seg_rows": parts, "tokens": toks, "est_items": est_items,
+                    "est": total_est, "amount": amount, "cur": cur, "items": items,
+                    "tokens_src": "站方(分段)",
+                    "k": (amount / total_est) if total_est else None,
+                    "seg_from": ""}
+        miss, cache, out, src = self._bill_tokens(bill)
+        r = self._resolve_single(host, model,
+                                 bill.get("seg_from") or bill.get("to") or bill.get("from"),
+                                 {"miss": miss, "cache": cache, "out": out},
+                                 amount, bill.get("amount_items"), cur)
+        r["tokens_src"] = src
+        return r
+
+    def apply_bill_ratio(self, bill, ratio=None):
+        """把反推出的倍率写回该账单对应的价格段（保留旧值 ratio_prev）。
+
+        多段条目：每段都填同一个整体倍率（k 是「标价 → 实收」的统一系数）。
+        """
+        if ratio is None:
+            ratio = (self.resolve_bill(bill) or {}).get("k")
+        if not ratio or not self.prices:
+            return False
+        host = bill.get("host")
+        model = bill.get("model") or "*"
+        entry = self.prices.entry_of(host, model)
+        segs = self.prices.segs(entry or {})
+        if segs:
+            ok = False
+            for p in segs:
+                ok = self.prices.set_seg_ratio(host, model, p.get("from") or "",
+                                               float(ratio)) or ok
+            return ok
+        return self.prices.set_seg_ratio(host, model, "", float(ratio))
+
+    def settle(self, day):
+        """把「上次水位 → 现在」的差值累加记入 *day*，并推进水位。"""
+        wm = self._watermark()
+        prev = self.data["watermark"].get("keys") or {}
+        dayrec = self.data["days"].setdefault(day, {})
+        moved = 0
+        for key, cur in wm.items():
+            p = prev.get(key) or {"calls": 0, "in": 0, "hit": 0, "out": 0}
+            d = {f: (cur.get(f, 0) - p.get(f, 0)) for f in ("calls", "in", "hit", "out")}
+            if not any(v > 0 for v in d.values()):
+                continue
+            moved += 1
+            host, model = key.split("|", 1)
+            cost, ratio, seg = self._price_cost(host, model, d, day=day)
+            tgt = dayrec.setdefault(key, {"calls": 0, "in": 0, "hit": 0, "out": 0, "cost": 0.0})
+            for f in ("calls", "in", "hit", "out"):
+                tgt[f] = tgt.get(f, 0) + d[f]
+            if cost is None:
+                tgt["cost"] = None if tgt.get("cost") is None else tgt["cost"]
+            else:
+                tgt["cost"] = (tgt.get("cost") or 0) + cost
+                if ratio is not None:
+                    tgt["ratio"] = ratio
+                if seg:
+                    tgt["seg_from"] = seg       # 这一段是按哪个价格段算的
+        self.data["watermark"]["keys"] = wm
+        self.data["watermark"]["ts"] = time.time()
+        self.save()
+        return moved
+
+    def maybe_settle(self):
+        """跨日 / 首次运行时推进账本。由 App 定时调用（内部限流）。"""
+        today = datetime.now().strftime("%Y-%m-%d")
+        wm = self.data["watermark"]
+        if wm.get("day") == today:
+            return False
+        if not wm.get("day"):
+            # 首次：只记水位，不做增量（避免把全部历史算成今天）
+            wm["keys"] = self._watermark()
+            wm["ts"] = time.time()
+            wm["day"] = today
+            self.save()
+            return False
+        # 已跨日 → 把差值记到「上次结算日」
+        self.settle(wm["day"])
+        wm["day"] = today
+        self.save()
+        return True
+
+    # ---------- 实时聚合 ----------
+    def live(self, since_ts=None, until_ts=None):
+        """按 last_seen 落在区间内实时聚合（用于 24h / 今天）。"""
+        agg = {}
+        today = datetime.now().strftime("%Y-%m-%d")
+        for host, model, calls, inp, hit, o, ls in db_query(
+                "SELECT billing_base_url, model, api_call_count, input_tokens, "
+                "cache_read_tokens, output_tokens, last_seen FROM session_model_usage"):
+            try:
+                t = float(ls or 0)
+            except (TypeError, ValueError):
+                t = 0.0
+            if t > 1e12:
+                t /= 1000.0
+            if since_ts and t < since_ts:
+                continue
+            if until_ts and t > until_ts:
+                continue
+            h = host or "?"
+            try:
+                h = canon_host(urlparse(host).hostname or h)
+            except Exception:
+                pass
+            key = "%s|%s" % (h, model)
+            a = agg.setdefault(key, {"calls": 0, "in": 0, "hit": 0, "out": 0,
+                                     "cost": 0.0, "unpriced": False})
+            a["calls"] += calls or 0
+            a["in"] += inp or 0
+            a["hit"] += hit or 0
+            a["out"] += o or 0
+            entry = self.prices.match(h, model) if self.prices else None
+            c = compute_cost(entry, inp or 0, hit or 0, o or 0, day=today)
+            if c is None:
+                a["unpriced"] = True
+            else:
+                a["cost"] += c["cost"]
+        return agg
+
+    # ---------- 查询入口 ----------
+    def report(self, win):
+        """win: '24h'|'today'|'7d'|'30d'|'all' → (agg, source_label)"""
+        now = datetime.now()
+        if win == "24h":
+            return self.live(since_ts=time.time() - 86400), "实时"
+        today0 = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        if win == "today":
+            return self.live(since_ts=today0.timestamp()), "实时"
+        n = {"7d": 7, "30d": 30, "all": None}.get(win, 7)
+        acc = {}
+        approx_hit = False
+        for day, rec in (self.data.get("days") or {}).items():
+            if n is not None:
+                try:
+                    dd = datetime.strptime(day, "%Y-%m-%d")
+                except ValueError:
+                    continue
+                if (now - dd).days >= n:
+                    continue
+                if day in (self.data.get("approx") or []):
+                    approx_hit = True
+            for key, v in rec.items():
+                parts = key.split("|", 1)
+                if len(parts) == 2:
+                    key = "%s|%s" % (canon_host(parts[0]), parts[1])
+                a = acc.setdefault(key, {"calls": 0, "in": 0, "hit": 0, "out": 0,
+                                         "cost": 0.0, "unpriced": False,
+                                         "unpriced_hist": False})
+                for f in ("calls", "in", "hit", "out"):
+                    a[f] += v.get(f) or 0
+                if v.get("cost") is None:
+                    # 账本里 cost=None = 结算/回填时该站还没配价。再看当前价格表：
+                    #  - 现在能匹配到 → 「历史缺价」：补价了没重算，点「重算历史」即可消除
+                    #  - 现在也匹配不到 → 「未配价」：价格表里真没这条，得先去补配
+                    if self.prices is not None and self.prices.match(*key.split("|", 1)):
+                        a["unpriced_hist"] = True
+                    else:
+                        a["unpriced"] = True
+                else:
+                    a["cost"] += v["cost"]
+        # 叠加「今天的实时」（账本只记到昨天，不会重复）
+        for key, v in self.live(since_ts=today0.timestamp()).items():
+            a = acc.setdefault(key, {"calls": 0, "in": 0, "hit": 0, "out": 0,
+                                     "cost": 0.0, "unpriced": False,
+                                     "unpriced_hist": False})
+            for f in ("calls", "in", "hit", "out"):
+                a[f] += v.get(f) or 0
+            a["cost"] += v.get("cost") or 0
+            a["unpriced"] = a["unpriced"] or v.get("unpriced", False)
+        return acc, ("账本" + ("+≈近似" if approx_hit else ""))
+
+
+class GapDialog:
+    def __init__(self, root, mon, d):
+        self.mon = mon
+        self.d = d
+        sid = d["sid"]
+        rep = d.get("report") or {}
+        est = d.get("estimate") or {}
+
+        self.win = tk.Toplevel(root)
+        self.win.title("缺账明细")
+        self.win.configure(bg=BG)
+        self.win.attributes("-topmost", True)
+        apply_icon(self.win)
+        apply_dark_title_bar(self.win, bg_hex=BG)
+        self.win.geometry("520x430")
+
+        self.sid = sid
+        self.lbl_head = tk.Label(self.win, text="", bg=BG, fg=FG, font=FONT, anchor="w")
+        self.lbl_head.pack(fill="x", padx=12, pady=(10, 2))
+        tk.Label(self.win, text="会话 %s · 每 2 秒自动刷新" % sid, bg=BG, fg=DIM,
+                 font=FONT_S, anchor="w").pack(fill="x", padx=12)
+
+        types = mon._gap_types(sid, rep) if rep.get("gaps") else []
+        anchor = (est or {}).get("anchor_in") or 0
+
+        # 底部信息区（先 pack，避免被表格挤掉）
+        bottom = tk.Frame(self.win, bg=BG)
+        bottom.pack(side="bottom", fill="x", padx=12, pady=(0, 10))
+        self.v_inc = tk.BooleanVar(value=bool(d.get("include_gap")))
+        tk.Checkbutton(bottom, text="把缺账估算计入成本行", variable=self.v_inc, bg=BG,
+                       fg=FG, selectcolor=BG, activebackground=BG, activeforeground=FG,
+                       font=FONT_S, command=self._toggle).pack(anchor="w")
+        if est:
+            txt = ("合计估算：+%s in（未命中 %s / 命中 %s） · +%s out%s"
+                   % (fmt_vol(est["in"]), fmt_vol(est["miss"]), fmt_vol(est["hit"]),
+                      fmt_vol(est["out"]),
+                      "　≈ %s" % fmt_money(est["cost"]) if est.get("cost") is not None else ""))
+        else:
+            txt = "无缺账估算（该会话没有记账锚点）"
+        self.lbl_sum = tk.Label(bottom, text=txt, bg=BG, fg=YELLOW, font=FONT_S, anchor="w",
+                                justify="left", wraplength=470)
+        self.lbl_sum.pack(anchor="w", pady=(5, 0))
+        tk.Label(bottom, text=(est or {}).get("note", ""), bg=BG, fg=DIM,
+                 font=FONT_S, anchor="w").pack(anchor="w")
+
+        # 表格区
+        mid = tk.Frame(self.win, bg=BG)
+        mid.pack(side="top", fill="both", expand=True, padx=12, pady=8)
+        vs = ttk.Scrollbar(mid, orient="vertical")
+        self.tree = ttk.Treeview(mid, columns=("t", "k", "v"), show="headings",
+                                 height=10, yscrollcommand=vs.set)
+        vs.config(command=self.tree.yview)
+        for c, h, w in (("t", "时间", 90), ("k", "类型", 70), ("v", "估算", 280)):
+            self.tree.heading(c, text=h)
+            self.tree.column(c, width=w, anchor="w")
+        self.tree.pack(side="left", fill="both", expand=True)
+        vs.pack(side="left", fill="y")
+        self._refresh()
+
+    def _refresh(self):
+        """每 2 秒重算：把「进行中」的请求也列出来，避免被误当成缺账。"""
+        try:
+            d = self.mon.build(self.sid)
+            rep = d.get("report") or {}
+            est = d.get("estimate") or {}
+            mark = ""
+            if rep.get("partial"):
+                mark = "（日志未覆盖全程）"
+            elif rep.get("concurrent"):
+                mark = "（并发时段，归属近似）"
+            self.lbl_head.config(text="真实请求 %d ｜ 已记账 %d ｜ 缺账 %d%s" % (
+                rep.get("real", 0), rep.get("recorded", 0), rep.get("gap", 0), mark))
+            for i in self.tree.get_children():
+                self.tree.delete(i)
+            if rep.get("inflight"):
+                self.tree.insert("", "end", values=(
+                    rep["inflight"][11:19], "进行中", "等待记账 →"))
+            anchor = est.get("anchor_in") or 0
+            for ts, kind in (self.mon._gap_types(self.sid, rep) if rep.get("gaps") else []):
+                self.tree.insert("", "end", values=(
+                    ts[11:19] if ts else "?", kind, "≈ %s prompt" % fmt_vol(anchor)))
+            if est:
+                self.lbl_sum.config(text="合计估算：+%s in（未命中 %s / 命中 %s） · +%s out%s" % (
+                    fmt_vol(est["in"]), fmt_vol(est["miss"]), fmt_vol(est["hit"]),
+                    fmt_vol(est["out"]),
+                    "　≈ %s" % fmt_money(est["cost"]) if est.get("cost") is not None else ""))
+        except Exception:
+            pass
+        self.win.after(2000, self._refresh)
+
+    def _toggle(self):
+        cb = getattr(self.mon, "on_gap_toggle", None)
+        if cb:
+            cb(self.v_inc.get())
+
+
+# ─────────────────────────── 悬浮窗 ───────────────────────────
+
+class StatsDialog:
+    """成本统计窗口：按站（或站+模型）汇总，5 个时间梯度。"""
+
+    WINS = (("24h", "24h"), ("today", "今天"), ("7d", "7天"),
+            ("30d", "30天"), ("all", "总共"))
+
+    def __init__(self, root, mon, on_close=None):
+        self.mon = mon
+        self.ledger = mon.cost_ledger
+        self.view = "site"
+        self.on_close = on_close
+        self._alive = True
+        self._after_id = None
+        self._probe_cache = None
+        self.win = tk.Toplevel(root)
+        self.win.title("成本统计")
+        self.win.configure(bg=BG)
+        self.win.attributes("-topmost", True)
+        apply_icon(self.win)
+        apply_dark_title_bar(self.win, bg_hex=BG)
+        self.win.geometry("700x470")
+
+        top = tk.Frame(self.win, bg=BG)
+        top.pack(fill="x", padx=10, pady=(10, 2))
+        self.btns = {}
+        for key, label in self.WINS:
+            b = tk.Button(top, text=label, width=6, bd=0, font=FONT, bg="#2a2a30", fg=FG,
+                          activebackground="#3a3a44", activeforeground=FG,
+                          command=lambda k=key: self.switch(k))
+            b.pack(side="left", padx=2)
+            self.btns[key] = b
+
+        # 视图切换：按中转站 / 按模型 / 总量
+        viewbar = tk.Frame(self.win, bg=BG)
+        viewbar.pack(fill="x", padx=10, pady=(2, 4))
+        tk.Label(viewbar, text="视图:", bg=BG, fg=DIM, font=FONT_S).pack(side="left")
+        self.vbtns = {}
+        for key, label in (("site", "按中转站"), ("model", "按模型"), ("total", "总量")):
+            b = tk.Button(viewbar, text=label, width=9, bd=0, font=FONT_S, bg="#2a2a30",
+                          fg=FG, activebackground="#3a3a44", activeforeground=FG,
+                          command=lambda k=key: self.set_view(k))
+            b.pack(side="left", padx=2)
+            self.vbtns[key] = b
+        self.lbl_hint = tk.Label(viewbar, text="", bg=BG, fg=DIM, font=FONT_S)
+        self.lbl_hint.pack(side="right")
+
+        cols = ("site", "model", "calls", "rate", "inp", "out", "cost", "share")
+        heads = ("站", "模型", "调用", "命中率", "命中 / 未命中", "输出", "成本", "占比")
+        widths = (150, 130, 55, 60, 150, 75, 80, 55)
+        self.tree = ttk.Treeview(self.win, columns=cols, show="headings", height=12)
+        for c, h, w in zip(cols, heads, widths):
+            self.tree.heading(c, text=h)
+            self.tree.column(c, width=w, anchor="w")
+        self.tree.pack(fill="both", expand=True, padx=10, pady=4)
+
+        bar = tk.Frame(self.win, bg=BG)
+        bar.pack(fill="x", padx=10, pady=(0, 2))
+        tk.Button(bar, text="重算历史", bd=0, font=FONT_S, bg="#2a2a30", fg=FG,
+                  activebackground="#3a3a44", activeforeground=FG,
+                  command=self.recompute_history).pack(side="left")
+        tk.Button(bar, text="录入实付", bd=0, font=FONT_S, bg="#2a2a30", fg=FG,
+                  activebackground="#3a3a44", activeforeground=FG,
+                  command=self.enter_bill).pack(side="left", padx=4)
+        self.lbl_rc = tk.Label(bar, text="", bg=BG, fg=DIM, font=FONT_S, anchor="w")
+        self.lbl_rc.pack(side="left", padx=8)
+
+        self.lbl_sum = tk.Label(self.win, text="", bg=BG, fg=YELLOW, font=FONT_S,
+                                anchor="w", justify="left", wraplength=670)
+        self.lbl_sum.pack(fill="x", padx=10, pady=(0, 10))
+        self.switch("24h")
+        self.win.bind("<Destroy>", self._on_destroy)
+        self._schedule()
+
+    # -------- 定时自动刷新（价格/账本变了窗口自己跟上） --------
+    REFRESH_MS = 3000
+
+    def _schedule(self):
+        if not self._alive:
+            return
+        try:
+            self._after_id = self.win.after(self.REFRESH_MS, self._auto_refresh)
+        except tk.TclError:
+            self._after_id = None
+            self._alive = False
+
+    def _auto_refresh(self):
+        self._after_id = None
+        if not self._alive:
+            return
+        try:
+            # 窗口不可见（最小化/被遮挡/已切走）→ 不做重活，只排下一次
+            if not self.win.winfo_viewable():
+                self._schedule()
+                return
+            self.refresh()
+        except tk.TclError:
+            self._alive = False
+            return
+        self._schedule()
+
+    def _on_destroy(self, ev=None):
+        """关窗：停掉定时器（否则 after 回调打到已销毁窗口 → TclError）。"""
+        if ev is not None and getattr(ev, "widget", None) is not self.win:
+            return
+        self._alive = False
+        if self._after_id:
+            try:
+                self.win.after_cancel(self._after_id)
+            except Exception:
+                pass
+            self._after_id = None
+        if self.on_close:
+            try:
+                self.on_close(self)
+            except Exception:
+                pass
+
+    def notify_prices_changed(self):
+        """价格保存后由 App 调用：立刻热重载价格表并重绘。"""
+        if not self._alive:
+            return
+        try:
+            if self.ledger.prices:
+                self.ledger.prices.load(force=True)
+        except Exception:
+            pass
+        try:
+            self.refresh(force=True)          # 价格变了，DB 探针看不出，强制重建
+        except tk.TclError:
+            self._alive = False
+
+    def recompute_history(self):
+        """重算历史：按天（推荐）/ 只补缺 / 全部按当前价 —— 三档，破坏性操作单独标红。"""
+        dlg = tk.Toplevel(self.win)
+        dlg.title("重算历史账本")
+        dlg.configure(bg=BG)
+        dlg.attributes("-topmost", True)
+        dlg.transient(self.win)
+        dlg.resizable(False, False)
+        tk.Label(dlg, text="按价格表的时间轴重算历史成本（tokens 不动）",
+                 bg=BG, fg=FG, font=FONT).pack(padx=16, pady=(12, 4), anchor="w")
+        tk.Label(dlg, text="· 按天重算：每天用「当天生效的价格段」→ 后来调价也不污染历史\n"
+                           "· 只补缺：只算「未配价」的条目，已算好的一律不碰\n"
+                           "· 全按当前价：用最新价格段覆盖全部历史（价格整段填错时才用）",
+                 bg=BG, fg=DIM, font=FONT_S, justify="left").pack(padx=16, anchor="w")
+        f = tk.Frame(dlg, bg=BG)
+        f.pack(padx=16, pady=12)
+        for text, mode, col in (("按天重算（推荐）", "day", "#2f5d3a"),
+                                ("只补缺", "missing", "#2a2a30"),
+                                ("全按当前价", "all", "#5d2f2f")):
+            tk.Button(f, text=text, bg=col, fg=FG, bd=0, font=FONT_S,
+                      activebackground="#3a3a44", activeforeground=FG,
+                      command=lambda m=mode, d=dlg: (d.destroy(), self._do_recompute(m))
+                      ).pack(side="left", padx=4)
+        tk.Button(f, text="取消", bg="#2a2a30", fg=FG, bd=0, font=FONT_S,
+                  activebackground="#3a3a44", activeforeground=FG,
+                  command=dlg.destroy).pack(side="left", padx=4)
+
+    def _do_recompute(self, mode):
+        try:
+            st = self.ledger.recompute(mode)
+        except Exception as ex:
+            messagebox.showerror("重算失败", str(ex), parent=self.win)
+            return
+        self.refresh()
+        messagebox.showinfo(
+            "重算完成",
+            "模式：%s\n扫描 %d 条 ｜ 算出金额 %d 条 ｜ 仍缺价 %d 条\n跳过 %d 条 ｜ 数值有变化 %d 条%s" % (
+                {"day": "按天重算", "missing": "只补缺", "all": "全按当前价"}.get(mode, mode),
+                st["scanned"], st["priced"], st["unpriced"], st["skipped"],
+                st.get("changed", 0),
+                "\n\n仍缺价的条目 = 价格表里确实没有该「站+模型」，去补配即可。"
+                if st["unpriced"] else ""),
+            parent=self.win)
+
+    def enter_bill(self):
+        """录一次站方实付账单（锚点）→ 自动反推倍率 / 真单价。"""
+        agg, _src = self.ledger.report(self.cur)
+        host, best = "", -1
+        for key, v in (agg or {}).items():
+            h = key.split("|", 1)[0]
+            if (v.get("calls") or 0) > best:
+                best = v.get("calls") or 0
+                host = h
+        dlg = BillDialog(self.win, self.ledger, host=host)
+        self.win.wait_window(dlg.win)
+        self.refresh(force=True)
+
+    def switch(self, key):
+        for k, b in self.btns.items():
+            b.config(bg="#2f5d3a" if k == key else "#2a2a30")
+        self.cur = key
+        self.refresh()
+
+    def set_view(self, key):
+        self.view = key
+        for k, b in self.vbtns.items():
+            b.config(bg="#2f5d3a" if k == key else "#2a2a30")
+        self.lbl_hint.config(text={"site": "每个中转站单独合计", "model": "站 × 模型逐条",
+                                   "total": "全部站 + 全部模型总计"}.get(key, ""))
+        self.refresh()
+
+    def _probe(self):
+        """便宜的「数据有没有变」探针（比 live() 省一个数量级）。"""
+        try:
+            r = db_query("SELECT COUNT(*), MAX(last_seen), SUM(api_call_count) "
+                         "FROM session_model_usage", one=True)
+        except Exception:
+            r = None
+        lb = self.ledger.data or {}
+        return (self.cur, self.view, tuple(r) if r else None,
+                len(lb.get("days") or {}), lb.get("recomputed_at"),
+                len(lb.get("bills") or []),
+                (lb.get("watermark") or {}).get("day"))
+
+    def refresh(self, force=False):
+        # 数据没变就不重建表格 —— 否则每 2 秒拆一次 30+ 行 Treeview，会顿卡 + 丢选中/滚动
+        try:
+            probe = self._probe()
+        except Exception:
+            probe = None
+        if not force and probe is not None and probe == self._probe_cache:
+            return
+        self._probe_cache = probe
+        try:
+            agg, src = self.ledger.report(self.cur)
+        except Exception as ex:
+            self.lbl_sum.config(text="统计失败：%s" % ex)
+            return
+        # 记住选中行 + 滚动位置，重建后恢复
+        sel_vals, yv = None, 0.0
+        try:
+            s = self.tree.selection()
+            if s:
+                sel_vals = self.tree.item(s[0], "values")
+            yv = self.tree.yview()[0]
+        except Exception:
+            pass
+        for i in self.tree.get_children():
+            self.tree.delete(i)
+        rows = {}
+        for key, v in (agg or {}).items():
+            host, model = key.split("|", 1)
+            if self.view == "site":
+                k = (host, "")
+            elif self.view == "model":
+                k = (host, model)
+            else:
+                k = ("全部中转站", "")
+            r = rows.setdefault(k, {"calls": 0, "in": 0, "hit": 0, "out": 0,
+                                    "cost": 0.0, "unpriced": False,
+                                    "unpriced_hist": False})
+            for f in ("calls", "in", "hit", "out"):
+                r[f] += v.get(f) or 0
+            r["cost"] += v.get("cost") or 0
+            if v.get("unpriced"):
+                r["unpriced"] = True
+            if v.get("unpriced_hist"):
+                r["unpriced_hist"] = True
+        total = sum(r["cost"] for r in rows.values())
+        unpriced_live = 0      # 价格表里真没条目
+        unpriced_hist = 0      # 账本里 cost=None（重算可消）
+        for (host, model), r in sorted(rows.items(), key=lambda kv: -kv[1]["calls"]):
+            tot_in = r["in"] + r["hit"]
+            rate = (r["hit"] * 100.0 / tot_in) if tot_in else 0.0
+            share = (r["cost"] / total * 100.0) if total else 0.0
+            cost_s = fmt_money(r["cost"])
+            missing = r["unpriced"] or r["unpriced_hist"]
+            if not r["cost"] and missing:
+                if r["unpriced"] and r["unpriced_hist"]:
+                    cost_s = "未配价/历史缺价"
+                elif r["unpriced"]:
+                    cost_s = "未配价"
+                else:
+                    cost_s = "历史未配价"
+            elif missing:
+                cost_s += " ✱"      # 有金额但含缺价部分（金额只算已配价的那部分）
+            if not r["cost"] and missing:
+                if r["unpriced"]:
+                    unpriced_live += r["calls"]
+                if r["unpriced_hist"]:
+                    unpriced_hist += r["calls"]
+            self.tree.insert("", "end", values=(
+                host, model or "（全部模型）", "{:,}".format(r["calls"]),
+                "%.1f%%" % rate, "%s / %s" % (fmt_vol(r["hit"]), fmt_vol(r["in"])),
+                fmt_vol(r["out"]), cost_s, ("%.1f%%" % share) if total else "-"))
+        notes = []
+        if unpriced_live:
+            notes.append("未配价 %d 次调用（价格表无此条目，去补配）" % unpriced_live)
+        if unpriced_hist:
+            notes.append("历史缺价 %d 次调用（点「重算历史」消除）" % unpriced_hist)
+        extra = ""
+        if notes:
+            extra = "　⚠ " + "；".join(notes)
+        if unpriced_live or unpriced_hist:
+            extra += "　✱ 含缺价条目的行金额只算已配价部分"
+        # 锚点对照：站方实付 vs 本表估算（有锚点的站才显示）
+        anchors = []
+        for b in (self.ledger.data.get("bills") or []):
+            if b["host"] not in {h for (h, _m) in rows}:
+                continue
+            rb = self.ledger.resolve_bill(b)
+            ours = sum(r2["cost"] for (h2, _m2), r2 in rows.items() if h2 == b["host"])
+            k = (rb["amount"] / ours) if ours else 0
+            calib = total - ours + rb["amount"]
+            anchors.append("[锚点] %s 本表 %s ｜ 站方 %s%.2f（k=%.4f）→ 校准后总合计 %s" % (
+                b["host"], fmt_money(ours), rb["cur"], rb["amount"], k, fmt_money(calib)))
+        if anchors:
+            extra += "\n" + "　".join(anchors)
+        if self.cur in ("30d", "all") and (self.ledger.data.get("approx") or []):
+            extra += "　≈ 回填段（%d 天）的时间分布为估算" % len(self.ledger.data.get("approx") or [])
+        self.lbl_sum.config(
+            text="合计 %s ｜ %d 个条目 ｜ 数据来源：%s%s" % (
+                fmt_money(total), len(rows), src, extra))
+        # 重算状态
+        st = self.ledger.data.get("recompute_stat") or {}
+        at = self.ledger.data.get("recomputed_at")
+        mode_txt = {"day": "按天", "missing": "只补缺", "all": "全按当前价"}.get(st.get("mode"), "")
+        if at:
+            self.lbl_rc.config(text="上次重算 %s ｜ %s %d 条（仍缺价 %d，变化 %d）" % (
+                at, mode_txt or st.get("mode") or "?", st.get("priced", 0),
+                st.get("unpriced", 0), st.get("changed", 0)))
+        else:
+            self.lbl_rc.config(text="按天重算：每天用当天生效的价格段；改价不会污染历史")
+        # 恢复选中行与滚动位置
+        try:
+            if sel_vals is not None:
+                for i in self.tree.get_children():
+                    if tuple(self.tree.item(i, "values"))[:2] == tuple(sel_vals)[:2]:
+                        self.tree.selection_set(i)
+                        break
+            self.tree.yview_moveto(yv)
+        except Exception:
+            pass
+
+
+class BillDialog:
+    """录入站方实付账单（锚点）→ 自动反推整体倍率 / 真单价 → 可选写回价格段。"""
+
+    def __init__(self, root, ledger, host="", model="*"):
+        self.ledger = ledger
+        self.win = tk.Toplevel(root)
+        self.win.title("录入站方实付")
+        self.win.configure(bg=BG)
+        self.win.attributes("-topmost", True)
+        apply_icon(self.win)
+        apply_dark_title_bar(self.win, bg_hex=BG)
+        self.win.resizable(False, False)
+        self.win.transient(root)
+
+        def frm(r):
+            f = tk.Frame(self.win, bg=BG)
+            f.grid(row=r, column=0, columnspan=6, sticky="we", padx=12, pady=3)
+            return f
+
+        def lab(f, t, dim=False):
+            tk.Label(f, text=t, bg=BG, fg=(DIM if dim else FG),
+                     font=FONT_S).pack(side="left")
+
+        def ent(f, val="", w=12):
+            e = tk.Entry(f, width=w, font=FONT_S, bg="#26262c", fg=FG,
+                         insertbackground=FG, bd=0, highlightthickness=1,
+                         highlightbackground="#3a3a42", highlightcolor=BLUE)
+            if val not in ("", None):
+                e.insert(0, str(val))
+            e.pack(side="left", padx=2)
+            return e
+
+        tk.Label(self.win, text="录一次站方账单，自动反推倍率 / 真单价（估算额按价格表算）",
+                 bg=BG, fg=FG, font=FONT).grid(row=0, column=0, columnspan=6,
+                                               sticky="w", padx=12, pady=(10, 2))
+        f = frm(1)
+        lab(f, "站")
+        self.e_host = ent(f, host, 26)
+        lab(f, "  模型")
+        self.e_model = ent(f, model, 22)
+
+        f = frm(2)
+        lab(f, "时间段")
+        self.e_from = ent(f, "", 11)
+        lab(f, " ~ ")
+        self.e_to = ent(f, "", 11)
+        lab(f, "  实付")
+        self.e_amt = ent(f, "", 10)
+        lab(f, "¥", True)
+
+        tk.Label(self.win, text="分项 token（可选：填了就用站方口径反解；跨调价段请分行填）",
+                 bg=BG, fg=DIM, font=FONT_S).grid(row=3, column=0, columnspan=6,
+                                                  sticky="w", padx=12, pady=(6, 0))
+        self.frm_tok = tk.Frame(self.win, bg=BG)
+        self.frm_tok.grid(row=4, column=0, columnspan=6, sticky="we", padx=12)
+        self.tok_rows = []
+        self._build_tok_rows(host, model)
+        fb = tk.Frame(self.win, bg=BG)
+        fb.grid(row=5, column=0, columnspan=6, sticky="w", padx=12, pady=(2, 0))
+        tk.Button(fb, text="重新读取价格段", bd=0, font=FONT_S, bg="#2a2a30", fg=FG,
+                  activebackground="#333", activeforeground=FG,
+                  command=lambda: self._build_tok_rows(
+                      self.e_host.get().strip(), self.e_model.get().strip() or "*")
+                  ).pack(side="left")
+
+        f = frm(6)
+        lab(f, "备注")
+        self.e_note = ent(f, "", 46)
+
+        self.lbl = tk.Label(self.win, text="", bg=BG, fg=YELLOW, font=FONT_S,
+                            anchor="w", justify="left", wraplength=580)
+        self.lbl.grid(row=7, column=0, columnspan=6, sticky="w", padx=12, pady=(6, 0))
+
+        f = tk.Frame(self.win, bg=BG)
+        f.grid(row=8, column=0, columnspan=6, sticky="e", padx=12, pady=(8, 12))
+        tk.Button(f, text="保存并反解", command=self.save_bill, bg="#2f5d3a", fg=FG, bd=0,
+                  activebackground="#3a7248", activeforeground=FG,
+                  font=FONT_S).pack(side="left", padx=4)
+        tk.Button(f, text="取消", command=self.win.destroy, bg="#2a2a30", fg=FG, bd=0,
+                  activebackground="#333", activeforeground=FG,
+                  font=FONT_S).pack(side="left")
+
+    def _build_tok_rows(self, host, model):
+        """按该站的价格段动态生成 token 输入行（跨调价也能精确反解）。"""
+        for w in self.frm_tok.winfo_children():
+            w.destroy()
+        self.tok_rows = []
+        segs = []
+        try:
+            if self.ledger.prices:
+                entry = self.ledger.prices.entry_of(host, model or "*")
+                segs = self.ledger.prices.segs(entry or {})
+        except Exception:
+            segs = []
+        froms = [p.get("from") or "" for p in segs] or [""]
+        for f in froms:
+            r = tk.Frame(self.frm_tok, bg=BG)
+            r.pack(fill="x", pady=1)
+            tk.Label(r, text="段 %-12s" % (f or "(全天)"), bg=BG, fg=FG,
+                     font=FONT_S, width=17, anchor="w").pack(side="left")
+            tk.Label(r, text="未命中", bg=BG, fg=DIM, font=FONT_S).pack(side="left")
+
+            def mk(w):
+                e = tk.Entry(r, width=w, font=FONT_S, bg="#26262c", fg=FG,
+                             insertbackground=FG, bd=0, highlightthickness=1,
+                             highlightbackground="#3a3a42", highlightcolor=BLUE)
+                e.pack(side="left", padx=2)
+                return e
+
+            e1 = mk(13)
+            tk.Label(r, text="缓存", bg=BG, fg=DIM, font=FONT_S).pack(side="left")
+            e2 = mk(13)
+            tk.Label(r, text="输出", bg=BG, fg=DIM, font=FONT_S).pack(side="left")
+            e3 = mk(11)
+            self.tok_rows.append((f, e1, e2, e3))
+
+    def save_bill(self):
+        host = self.e_host.get().strip()
+        if not host:
+            self.lbl.config(text="⚠ 「站」要填，例如 tokenrhythm.studio", fg=RED)
+            return
+        try:
+            amt = float(self.e_amt.get().strip() or 0)
+        except ValueError:
+            self.lbl.config(text="⚠ 实付金额填数字", fg=RED)
+            return
+        if amt <= 0:
+            self.lbl.config(text="⚠ 实付金额要大于 0", fg=RED)
+            return
+
+        def iv(w):
+            try:
+                return int(float(w.get().strip() or 0))
+            except ValueError:
+                return 0
+
+        bill = {"host": host, "model": self.e_model.get().strip() or "*",
+                "from": self.e_from.get().strip(), "to": self.e_to.get().strip(),
+                "amount": amt, "cur": "¥", "note": self.e_note.get().strip()}
+        by = {}
+        for f, e1, e2, e3 in self.tok_rows:
+            mm, cc, oo = iv(e1), iv(e2), iv(e3)
+            if mm or cc or oo:
+                by[f] = {"miss": mm, "cache": cc, "out": oo}
+        if by:
+            if len(by) == 1 and "" in by:
+                bill["tokens"] = by[""]
+            else:
+                bill["tokens_by_seg"] = by
+        self.ledger.add_bill(bill)
+        r = self.ledger.resolve_bill(bill)
+        k = r.get("k") or 0
+        txt = "估算 ¥%.2f ｜ 实付 ¥%.2f ｜ 整体倍率 k=%.4f\n（token 来源：%s）" % (
+            r["est"], r["amount"], k, r.get("tokens_src"))
+        for it in (r.get("items") or []):
+            txt += "\n  %s：单价 %s ｜ 估算 ¥%.2f" % (it["label"], it["price"], it["est"])
+        if r.get("seg_rows"):
+            for sr in r["seg_rows"]:
+                txt += "\n  · 段 %s：估算 ¥%.2f ｜ 分摊实付 ¥%.2f" % (
+                    sr["seg_from"] or "(最早)", sr["est"], sr.get("amount_share") or 0)
+
+        if k and abs(k - 1.0) > 0.005:      # 0.5% 以内视为一致，不值得动价格
+            if messagebox.askyesno(
+                    "反解结果",
+                    txt + "\n\n要把倍率 %.4f 填进价格表吗？\n"
+                    "（多段条目会把各段都填上这个倍率）" % k, parent=self.win):
+                ok = self.ledger.apply_bill_ratio(bill, k)
+                self.lbl.config(
+                    text=("✅ 已把倍率 %.4f 写入 %s 的价格段（可在价格表里核对）" % (k, host))
+                    if ok else "⚠ 该站还没有价格条目，先去价格表建一条再应用", fg=GREEN)
+                return
+        else:
+            messagebox.showinfo(
+                "反解结果",
+                txt + "\n\nk ≈ 1.0（差 %.2f%%）：标价与站方账单基本一致，不需要填倍率。"
+                % (abs(k - 1.0) * 100 if k else 0), parent=self.win)
+        self.win.destroy()
+
+
+# ─────────────── 提示注入：预设库（hints.json） ───────────────
+# 存在我们自己的数据目录（%APPDATA%\HermesCacheMonitor\），不碰 Hermes 任何文件。
+
+HINT_BUILTIN_NAME = "无注入"
+
+
+def hint_presets_path():
+    """预设库路径。放自己数据目录，与 Hermes 完全隔离。"""
+    return os.path.join(_appdata_dir(), "hints.json")
+
+
+def hint_confirm_text(preset):
+    """构造「注入确认框」的标题句 + 正文（菜单与管理窗共用）。"""
+    kind = preset.get("kind")
+    text = (preset.get("text") or "").rstrip()
+    if kind == "none":
+        return ("确定删除 environment_hint（回到无注入）？",
+                "当前内容会被移除，下次开新会话就不再注入。")
+    lines = text.split("\n")
+    return ("确定注入「%s」？" % preset.get("name"),
+            "首行：%s\n共 %d 字符 / %d 行" % (
+                (lines[0][:48] if lines and lines[0] else "（空内容）"), len(text), len(lines)))
+
+
+def apply_hint_preset_direct(preset, parent):
+    """不起管理窗，直接对一个预设走「确认 → 写入」。菜单点预设用这条。"""
+    store = HintStore()
+    store.load()
+    head, body = hint_confirm_text(preset)
+    if not messagebox.askokcancel(
+            "提示注入", "%s\n\n%s\n\n⚠ 只对**新开**的会话生效。" % (head, body), parent=parent):
+        return False
+    if preset.get("kind") == "none":
+        ok, msg = write_hint("", remove=True)
+    else:
+        ok, msg = write_hint((preset.get("text") or "").rstrip())
+    if ok:
+        store.active = preset.get("name")
+        store.save()
+        _HINT_CACHE["t"] = 0.0
+        messagebox.showinfo("提示注入", "%s\n\n开新会话后生效。" % msg, parent=parent)
+    else:
+        messagebox.showerror("提示注入", msg, parent=parent)
+    return ok
+
+
+class HintStore:
+    """environment_hint 预设库。
+
+    initial 记「首次运行本功能时」config 的原始状态（方案 A，「恢复初始」用）；
+    active 只是便利缓存，**真值以 config.yaml 实时读为准**（手动改过 config 也不会显示错）。
+    """
+
+    def __init__(self, path=None):
+        self.path = path or hint_presets_path()
+        self.version = 1
+        self.initial = {"present": False, "raw_block": ""}
+        self.presets = []
+        self.active = HINT_BUILTIN_NAME
+        # 非空 = 「文件在、但读不了」→ 禁止写回（否则会把预设库覆盖成空库）
+        self._load_error = ""
+
+    # ---------- 读写 ----------
+    def load(self):
+        """读预设库。
+
+        ⚠ 关键：文件不存在（首次运行）才允许「建库并落盘」；
+        读失败（被同步工具锁住 / 文件损坏）必须直接返回、**绝不写回** ——
+        原实现不分情况一律 save()，会把用户的预设（含万字大块）清空（实测复现）。
+        """
+        self._load_error = ""
+        d = None
+        try:
+            with open(self.path, "r", encoding="utf-8-sig") as f:
+                d = json.load(f)
+        except FileNotFoundError:
+            d = None                    # 首次运行 → 建库
+        except Exception as ex:
+            self._load_error = "预设库读失败：%s" % ex
+            return                      # ← 直接返回，不 save
+        if not isinstance(d, dict):
+            # 文件不存在、或内容不是预期结构 → 从空库起步
+            self.presets = []
+            self.active = HINT_BUILTIN_NAME
+            self._ensure_builtin()
+            self.first_run_capture()
+            self.save()
+            return
+        self.version = d.get("version") or 1
+        ini = d.get("initial")
+        self.initial = ini if isinstance(ini, dict) else {"present": False, "raw_block": ""}
+        ps = d.get("presets")
+        self.presets = ([p for p in ps if isinstance(p, dict) and p.get("name")]
+                        if isinstance(ps, list) else [])
+        self.active = d.get("active") or HINT_BUILTIN_NAME
+        self._ensure_builtin()
+        self.first_run_capture()
+
+    def save(self):
+        """原子写：临时文件 + os.replace（避免写一半被 kill 变空文件）。
+
+        读失败（_load_error 非空）时拒绝写盘 —— 否则会用空库覆盖原文件。
+        """
+        if self._load_error:
+            _startup_log("预设库保存被拒（%s）" % self._load_error)
+            return False
+        d = {
+            "version": self.version,
+            "initial": dict(self.initial or {}),
+            "presets": list(self.presets),
+            "active": self.active or HINT_BUILTIN_NAME,
+        }
+        tmp = self.path + ".tmp"
+        try:
+            os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        except Exception:
+            pass
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(d, f, ensure_ascii=False, indent=1)
+            os.replace(tmp, self.path)
+            return True
+        except Exception:
+            try:
+                if os.path.isfile(tmp):
+                    os.remove(tmp)
+            except Exception:
+                pass
+            return False
+
+    # ---------- 初始状态（方案 A） ----------
+    def first_run_capture(self):
+        """只在「还没抓过」时抓一次 config 当前状态。抓完立刻落盘（防没保存就关）。"""
+        if self.initial.get("captured"):
+            return False
+        t, present, p = read_hint()
+        if not p:
+            return False            # 找不到 config，不写死，下次再试
+        self.initial = {
+            "present": bool(present),
+            "raw_block": t or "",
+            "captured": True,
+            "at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        self.save()
+        return True
+
+    # ---------- 预设增删改查 ----------
+    def _ensure_builtin(self):
+        """保证「无注入」这条存在且不可删（kind=none → 删键）。"""
+        for p in self.presets:
+            if p.get("name") == HINT_BUILTIN_NAME:
+                p["kind"] = "none"
+                p["builtin"] = True
+                p.setdefault("text", "")
+                return
+        self.presets.insert(0, {"name": HINT_BUILTIN_NAME, "kind": "none",
+                                "builtin": True, "text": ""})
+
+    def list_presets(self):
+        self._ensure_builtin()
+        return self.presets
+
+    def get(self, name):
+        for p in self.presets:
+            if p.get("name") == name:
+                return p
+        return None
+
+    def upsert(self, name, text, old_name=None):
+        """新增 / 改名 / 改内容。返回 (ok, message)。
+
+        old_name=None → **新建语义**：同名已存在则拒绝（GUI「新建」走这条）。
+        old_name=某名  → 编辑语义：把那条改成 name（改名也走这条）。
+        """
+        name = (name or "").strip()
+        if not name:
+            return False, "预设名不能为空"
+        if len(name) > 40:
+            return False, "预设名太长（≤40 字符）"
+        existing = self.get(name)
+        if old_name is None:
+            if existing is not None:
+                if existing.get("builtin"):
+                    return False, ("「%s」是内置项，不能改名或改内容\n"
+                                   "（它的作用就是「删除注入、回到初始」）" % HINT_BUILTIN_NAME)
+                return False, "已存在同名预设「%s」" % name
+            cur = None
+        else:
+            cur = self.get((old_name or "").strip())
+            if cur is None:
+                return False, "找不到要修改的预设「%s」" % old_name
+            if cur.get("builtin"):
+                return False, ("「%s」是内置项，不能改名或改内容\n"
+                               "（它的作用就是「删除注入、回到初始」）" % HINT_BUILTIN_NAME)
+            if existing is not None and existing is not cur:
+                return False, "已存在同名预设「%s」" % name
+        if cur is not None:
+            cur["text"] = text or ""
+            cur["kind"] = "text"
+            cur["name"] = name
+        else:
+            self.presets.append({"name": name, "kind": "text",
+                                 "builtin": False, "text": text or ""})
+        self.save()
+        return True, "已保存「%s」" % name
+
+    def delete(self, name):
+        p = self.get(name)
+        if p is None:
+            return False, "没有「%s」" % name
+        if p.get("builtin"):
+            return False, "「%s」是内置项，不能删" % HINT_BUILTIN_NAME
+        self.presets = [x for x in self.presets if x.get("name") != name]
+        if self.active == name:
+            self.active = HINT_BUILTIN_NAME
+        self.save()
+        return True, "已删除「%s」" % name
+
+    # ---------- 生效状态（实时读 config，不信 active 字段） ----------
+    def current_active(self):
+        """返回当前生效的预设名；比不中 → 「（自定义/外部修改）」。"""
+        t, present, p = read_hint()
+        if not p:
+            return "（未找到 config）"
+        if not present:
+            return HINT_BUILTIN_NAME
+        for pr in self.list_presets():
+            if pr.get("kind") == "text" and \
+                    (pr.get("text") or "").rstrip() == (t or "").rstrip():
+                return pr.get("name")
+        return "（自定义/外部修改）"
+
+
+class HintDialog:
+    """提示注入管理窗（结构照抄 PriceDialog：Toplevel + 确认框 + 底部按钮）。"""
+
+    def __init__(self, root, on_changed=None):
+        self.root = root
+        self.on_changed = on_changed
+        self.store = HintStore()
+        self.store.load()
+        self._edit_name = None
+
+        self.win = tk.Toplevel(root)
+        self.win.title("提示注入（environment_hint）")
+        self.win.configure(bg=BG)
+        self.win.attributes("-topmost", True)
+        apply_icon(self.win)
+        apply_dark_title_bar(self.win, bg_hex=BG)
+        self.win.resizable(False, False)
+        self.win.transient(root)
+
+        self.lbl_cur = tk.Label(self.win, text="", bg=BG, fg=YELLOW, font=FONT,
+                                anchor="w", justify="left")
+        self.lbl_cur.grid(row=0, column=0, columnspan=2, sticky="w",
+                          padx=12, pady=(10, 2))
+
+        # 左：预设列表
+        lf = tk.Frame(self.win, bg=BG)
+        lf.grid(row=1, column=0, sticky="ns", padx=(12, 6), pady=4)
+        tk.Label(lf, text="预设", bg=BG, fg=DIM, font=FONT_S, anchor="w").pack(fill="x")
+        self.lst = tk.Listbox(lf, width=17, height=11, bg="#26262c", fg=FG, font=FONT,
+                              bd=0, highlightthickness=1, highlightbackground="#3a3a42",
+                              highlightcolor=BLUE, selectbackground="#3a5a7a",
+                              selectforeground=FG, activestyle="none")
+        self.lst.pack()
+        self.lst.bind("<<ListboxSelect>>", self.on_pick)
+
+        # 右：名字 + 内容
+        rf = tk.Frame(self.win, bg=BG)
+        rf.grid(row=1, column=1, sticky="nsew", padx=(0, 12), pady=4)
+        nf = tk.Frame(rf, bg=BG)
+        nf.pack(fill="x")
+        tk.Label(nf, text="名字", bg=BG, fg=FG, font=FONT).pack(side="left")
+        self.e_name = tk.Entry(nf, width=20, font=FONT, bg="#26262c", fg=FG,
+                               insertbackground=FG, bd=0, highlightthickness=1,
+                               highlightbackground="#3a3a42", highlightcolor=BLUE)
+        self.e_name.pack(side="left", padx=4)
+        self.lbl_count = tk.Label(nf, text="0 字符", bg=BG, fg=DIM, font=FONT_S)
+        self.lbl_count.pack(side="left", padx=(6, 0))
+
+        self.txt = tk.Text(rf, width=46, height=9, bg="#26262c", fg=FG, font=FONT,
+                           insertbackground=FG, bd=0, highlightthickness=1,
+                           highlightbackground="#3a3a42", highlightcolor=BLUE,
+                           wrap="word", undo=True)
+        self.txt.pack(fill="both", expand=True, pady=(4, 0))
+        self.txt.bind("<KeyRelease>", lambda _e: self._refresh_count())
+
+        tk.Label(rf, text="⚠ 需开新会话生效（当前会话的系统提示已冻结，不受影响）",
+                 bg=BG, fg="#c98a4b", font=FONT_S, anchor="w",
+                 justify="left", wraplength=340).pack(fill="x", pady=(4, 0))
+
+        self.lbl_msg = tk.Label(self.win, text="", bg=BG, fg=YELLOW, font=FONT_S,
+                                anchor="w", justify="left", wraplength=440)
+        self.lbl_msg.grid(row=2, column=0, columnspan=2, sticky="w", padx=12, pady=(6, 0))
+
+        bf = tk.Frame(self.win, bg=BG)
+        bf.grid(row=3, column=0, columnspan=2, sticky="e", padx=12, pady=(6, 12))
+        for text, cmd, color in (
+                ("注入选中", self.inject, "#2f5d3a"),
+                ("新建", self.new_preset, "#2a2a30"),
+                ("保存修改", self.save_preset, "#2a2a30"),
+                ("删除", self.del_preset, "#2a2a30"),
+                ("恢复初始", self.restore_initial, "#5a3a2a"),
+                ("关闭", self.win.destroy, "#2a2a30")):
+            tk.Button(bf, text=text, command=cmd, bg=color, fg=FG, bd=0,
+                      activebackground="#3a3a42", activeforeground=FG, font=FONT,
+                      width=9).pack(side="left", padx=3)
+
+        self.reload_list()
+        try:
+            self.win.grab_set()
+        except Exception:
+            pass
+
+    # ---------- 列表与选中 ----------
+    def reload_list(self, keep=None):
+        try:
+            cur = self.store.current_active()
+        except Exception:
+            cur = ""
+        try:
+            self.lbl_cur.config(text="当前生效：%s" % cur, fg=YELLOW)
+        except Exception:
+            pass
+        try:
+            self.lst.delete(0, "end")
+        except Exception:
+            pass
+        names = []
+        for p in self.store.list_presets():
+            n = p.get("name")
+            names.append(n)
+            mark = "● " if n == cur else ("✓ " if p.get("builtin") else "   ")
+            self.lst.insert("end", "%s%s" % (mark, n))
+        if not names:
+            return
+        idx = names.index(keep) if (keep and keep in names) else 0
+        self.lst.selection_clear(0, "end")
+        self.lst.selection_set(idx)
+        self.lst.activate(idx)
+        self.on_pick()
+
+    def sel_name(self):
+        sel = self.lst.curselection()
+        if not sel:
+            return None
+        s = self.lst.get(sel[0])
+        for pre in ("● ", "✓ ", "   "):
+            if s.startswith(pre):
+                s = s[len(pre):]
+                break
+        return s.strip()
+
+    def on_pick(self, _ev=None):
+        name = self.sel_name()
+        if not name:
+            return
+        p = self.store.get(name)
+        if p is None:
+            return
+        self._edit_name = name
+        self.e_name.delete(0, "end")
+        self.e_name.insert(0, name)
+        self.txt.delete("1.0", "end")
+        if p.get("kind") == "text":
+            self.txt.insert("1.0", p.get("text") or "")
+        self._refresh_count()
+        if p.get("builtin"):
+            self.lbl_msg.config(
+                text="「%s」= 删除注入、回到初始状态（内置项，内容不可改）" % HINT_BUILTIN_NAME,
+                fg=DIM)
+        else:
+            self.lbl_msg.config(text="", fg=YELLOW)
+
+    def _refresh_count(self):
+        t = self.txt.get("1.0", "end-1c")
+        try:
+            self.lbl_count.config(text="%d 字符 / %d 行" % (
+                len(t), (t.count("\n") + 1) if t else 0))
+        except Exception:
+            pass
+        return t
+
+    # ---------- 按钮动作 ----------
+    def inject(self):
+        name = self.sel_name()
+        if not name:
+            self.lbl_msg.config(text="⚠ 先在左边选一个预设", fg=RED)
+            return
+        p = self.store.get(name)
+        if p is None:
+            return
+        head, body = hint_confirm_text(p)
+        if not messagebox.askokcancel(
+                "提示注入", "%s\n\n%s\n\n⚠ 只对**新开**的会话生效。" % (head, body),
+                parent=self.win):
+            return
+        if p.get("kind") == "none":
+            ok, msg = write_hint("", remove=True)
+        else:
+            ok, msg = write_hint((p.get("text") or "").rstrip())
+        if ok:
+            self.store.active = name
+            self.store.save()
+            _HINT_CACHE["t"] = 0.0
+            if self.on_changed:
+                self.on_changed()
+            self.reload_list(keep=name)
+            self.lbl_msg.config(text="✓ %s　（开新会话后生效）" % msg.replace("\n", " "),
+                                fg=GREEN)
+        else:
+            self.lbl_msg.config(text="⚠ %s" % msg.replace("\n", " "), fg=RED)
+
+    def new_preset(self):
+        self.lst.selection_clear(0, "end")
+        self._edit_name = None
+        self.e_name.delete(0, "end")
+        self.txt.delete("1.0", "end")
+        self._refresh_count()
+        try:
+            self.e_name.focus_set()
+        except Exception:
+            pass
+        self.lbl_msg.config(text="填名字和内容 → 点「保存修改」即新建（再点「注入选中」生效）",
+                            fg=BLUE)
+
+    def save_preset(self):
+        name = self.e_name.get().strip()
+        text = self.txt.get("1.0", "end-1c")
+        p = self.store.get(self._edit_name) if self._edit_name else None
+        if p is not None and p.get("builtin"):
+            self.lbl_msg.config(text="⚠ 「%s」是内置项，不能改" % HINT_BUILTIN_NAME, fg=RED)
+            return
+        ok, msg = self.store.upsert(name, text, old_name=self._edit_name)
+        if not ok:
+            self.lbl_msg.config(text="⚠ %s" % msg.replace("\n", " "), fg=RED)
+            return
+        self._edit_name = name
+        self.reload_list(keep=name)
+        self.lbl_msg.config(text="✓ %s（还没注入，点「注入选中」才生效）" % msg, fg=GREEN)
+
+    def del_preset(self):
+        name = self.sel_name()
+        if not name:
+            return
+        p = self.store.get(name)
+        if p is not None and p.get("builtin"):
+            self.lbl_msg.config(text="⚠ 「%s」是内置项，不能删" % HINT_BUILTIN_NAME, fg=RED)
+            return
+        if not messagebox.askyesno(
+                "删除预设", "删除预设「%s」？\n（只删这条预设，不动 config.yaml）" % name,
+                parent=self.win):
+            return
+        ok, msg = self.store.delete(name)
+        self._edit_name = None
+        self.reload_list()
+        self.lbl_msg.config(text=("✓ " if ok else "⚠ ") + msg, fg=GREEN if ok else RED)
+
+    def restore_initial(self):
+        ini = self.store.initial or {}
+        present = bool(ini.get("present"))
+        raw = ini.get("raw_block") or ""
+        if not present:
+            head = "初始状态 = environment_hint 键不存在"
+            body = "执行后等价于「无注入」（删除该键）。"
+        else:
+            head = "初始状态（首次运行本功能时抓到的）"
+            body = "共 %d 字符 / %d 行：\n%s%s" % (
+                len(raw), raw.count("\n") + 1, raw[:180], "…" if len(raw) > 180 else "")
+        if not messagebox.askokcancel(
+                "恢复初始",
+                "%s\n\n%s\n\n记于：%s\n\n确定写回？" % (head, body, ini.get("at") or "（未知）"),
+                parent=self.win):
+            return
+        if present:
+            ok, msg = write_hint(raw)
+        else:
+            ok, msg = write_hint("", remove=True)
+        if ok:
+            _HINT_CACHE["t"] = 0.0
+            if self.on_changed:
+                self.on_changed()
+            self.reload_list()
+            self.lbl_msg.config(text="✓ 已恢复初始状态（开新会话后生效）", fg=GREEN)
+        else:
+            self.lbl_msg.config(text="⚠ %s" % msg.replace("\n", " "), fg=RED)
+
+
+class App:
+    def __init__(self):
+        self.mon = Monitor()
+        self.include_gap = False
+        self.mon.on_gap_toggle = self._set_include_gap
+        self.last_d = None
+        self._stats = []          # 已打开的成本统计窗口（价格改完主动通知刷新）
+        self._hint_dlg = None     # 提示注入管理窗（单例，重复点只抬起）
+        self._flash_msg = None    # 状态行临时反馈：(文本, 过期时间, 是否警告)
+
+        cfg = load_config()
+        self.alpha = float(cfg.get("alpha", 0.90))
+        self.mini_mode = bool(cfg.get("mini_mode", False))
+        # 尺寸记忆：宽度全局保持，高度各自独立记忆
+        self.win_w = int(cfg.get("win_w", 420))
+        _def_h = 286 + (18 if (_uia is None or _NO_UIA or _DATA_SPLIT) else 0)
+        self.full_h = int(cfg.get("full_h", _def_h))
+        self.mini_h = int(cfg.get("mini_h", 86))
+
+        self.root = tk.Tk()
+        self.root.title("缓存跟随监控")
+        _startup_log("启动: icon_b64=%d, hermes_home=%s, data_dir=%s, no_uia=%s, profile=%s" % (
+            len(_ICON_B64), HERMES_HOME or "(未找到)", WORK_DIR, _NO_UIA, _PROFILE))
+        apply_icon(self.root)
+        apply_dark_title_bar(self.root, bg_hex=BG)
+        sw = self.root.winfo_screenwidth()
+        self.root.attributes("-topmost", True)
+        self.root.configure(bg=BG)
+        try:
+            self.root.attributes("-alpha", self.alpha)
+        except Exception:
+            pass
+
+        # === 完整模式容器 ===
+        self.frm_full = tk.Frame(self.root, bg=BG)
+
+        # ── 底部固定区（先 side='bottom' 打包，焊死在窗口底端，无论上面文字多长都不被顶掉）──
+        warn = []
+        if _uia is None:
+            warn.append("UIA 不可用（跟随变慢）→ pip install uiautomation")
+        elif _NO_UIA:
+            warn.append("UIA 已手动禁用（--no-uia）")
+        if _DATA_SPLIT:
+            warn.append("检测到两份数据，命令行请用 py 运行")
+        self.lbl_warn = tk.Label(self.frm_full, text="⚠ " + "　⚠ ".join(warn) if warn else "",
+                                 bg=BG, fg="#c98a4b", font=FONT_S, anchor="w",
+                                 justify="left", wraplength=390)
+        if warn:
+            self.lbl_warn.pack(side="bottom", fill="x", padx=12, pady=(0, 2))
+
+        self.lbl_footer = tk.Label(self.frm_full, text="", bg=BG, fg=DIM, font=FONT_S,
+                                   anchor="w", cursor="hand2")
+        self.lbl_footer.pack(side="bottom", fill="x", padx=12, pady=(2, 6))
+        self.lbl_footer.bind("<Button-1>", self.on_footer_click)
+
+        frm_tools = tk.Frame(self.frm_full, bg=BG)
+        frm_tools.pack(side="bottom", fill="x", padx=12, pady=(2, 2))
+        self.lbl_stats = tk.Label(frm_tools, text="📊 成本统计", bg=BG, fg=BLUE,
+                                  font=FONT_S, cursor="hand2")
+        self.lbl_stats.pack(side="left")
+        self.lbl_stats.bind("<Button-1>", lambda _e: self.open_stats())
+        self.use_calibration = True
+        self.lbl_calib = tk.Label(frm_tools, text="⚖ 校准", bg=BG, fg=BLUE,
+                                  font=FONT_S, cursor="hand2")
+        self.lbl_calib.pack(side="left", padx=(8, 0))
+        self.lbl_calib.bind("<Button-1>", self.on_calib_click)
+        self.lbl_prices = tk.Label(frm_tools, text="⚙ 价格表", bg=BG, fg=BLUE,
+                                   font=FONT_S, cursor="hand2")
+        self.lbl_prices.pack(side="right")
+        self.lbl_prices.bind("<Button-1>", lambda _e: self.on_cost_right())
+        self.lbl_hint = tk.Label(frm_tools, text="💬 提示注入", bg=BG, fg=BLUE,
+                                 font=FONT_S, cursor="hand2")
+        self.lbl_hint.pack(side="right", padx=(0, 10))
+        self.lbl_hint.bind("<Button-1>", lambda _e: self.open_hint())
+        self.lbl_refresh = tk.Label(frm_tools, text="🔄 刷新", bg=BG, fg=BLUE,
+                                    font=FONT_S, cursor="hand2")
+        self.lbl_refresh.pack(side="right", padx=(0, 10))
+        self.lbl_refresh.bind("<Button-1>", self.do_refresh)
+
+        self.frm_gap = tk.Frame(self.frm_full, bg=BG)
+        self.frm_gap.pack(side="bottom", fill="x", padx=12, pady=(2, 0))
+        self.lbl_gap = tk.Label(self.frm_gap, text="", bg=BG, fg="#c98a4b", font=FONT_S,
+                                anchor="w", justify="left", cursor="hand2")
+        self.lbl_gap.pack(side="left")
+        self.lbl_gap.bind("<Button-1>", self.on_gap_click)
+        self.lbl_gap_detail = tk.Label(self.frm_gap, text="明细 ▸", bg=BG, fg=BLUE,
+                                       font=FONT_S, cursor="hand2")
+        self.lbl_gap_detail.pack(side="right", padx=(6, 0))
+        self.lbl_gap_detail.bind("<Button-1>", self.on_gap_detail)
+
+        # ── 顶部内容区（从上往下排列，文字自动换行）──
+        frm_header = tk.Frame(self.frm_full, bg=BG)
+        frm_header.pack(side="top", fill="x", padx=12, pady=(8, 0))
+        # ★ 先 pack 右侧缩小按钮：保证绝对不会被左侧长文本挤掉！
+        self.btn_mini = tk.Label(frm_header, text="🗕", bg=BG, fg=DIM,
+                                 font=("Segoe UI Symbol", 11), cursor="hand2")
+        self.btn_mini.pack(side="right", padx=(6, 0))
+        self.btn_mini.bind("<Button-1>", lambda _e: self.toggle_mini_mode())
+        # 左侧标题后 pack
+        self.lbl_title = tk.Label(frm_header, text="...", bg=BG, fg=FG,
+                                  font=("Microsoft YaHei UI", 10), anchor="w", justify="left",
+                                  wraplength=max(140, self.win_w - 60))
+        self.lbl_title.pack(side="left", fill="x", expand=True)
+
+        self.lbl_rate = tk.Label(self.frm_full, text="--", bg=BG, fg=GREEN, font=FONT_L, anchor="w")
+        self.lbl_rate.pack(side="top", fill="x", padx=12)
+
+        self.lbl_detail = tk.Label(self.frm_full, text="", bg=BG, fg=DIM, font=FONT,
+                                   anchor="w", justify="left", wraplength=max(180, self.win_w - 28))
+        self.lbl_detail.pack(side="top", fill="x", padx=12)
+
+        self.lbl_cost = tk.Label(self.frm_full, text="", bg=BG, fg=YELLOW, font=FONT_CODE,
+                                 anchor="w", justify="left", cursor="hand2", wraplength=max(180, self.win_w - 28))
+        self.lbl_cost.pack(side="top", fill="x", padx=12, pady=(2, 0))
+        self.lbl_cost.bind("<Button-1>", self.on_cost_click)
+        self.lbl_cost.bind("<Button-3>", self.on_cost_right)
+
+        # === 迷你模式容器 ===
+        self.frm_mini = tk.Frame(self.root, bg=BG)
+        frm_mini_top = tk.Frame(self.frm_mini, bg=BG)
+        frm_mini_top.pack(fill="x", padx=10, pady=(6, 2))
+
+        # ★ 先 pack 右侧展开按钮：保证绝对不被左边文字挤掉！
+        self.btn_expand = tk.Label(frm_mini_top, text="🗖", bg=BG, fg=DIM,
+                                   font=("Segoe UI Symbol", 11), cursor="hand2")
+        self.btn_expand.pack(side="right", padx=(6, 0))
+        self.btn_expand.bind("<Button-1>", lambda _e: self.toggle_mini_mode())
+
+        self.mini_lbl_rate = tk.Label(frm_mini_top, text="--", bg=BG, fg=GREEN,
+                                      font=FONT_L)
+        self.mini_lbl_rate.pack(side="left")
+
+        self.mini_lbl_tokens = tk.Label(frm_mini_top, text="", bg=BG, fg=FG,
+                                        font=FONT_CODE_S, wraplength=max(100, self.win_w - 120), justify="left")
+        self.mini_lbl_tokens.pack(side="left", fill="x", expand=True, padx=(8, 0))
+
+        self.mini_lbl_cost = tk.Label(self.frm_mini, text="", bg=BG, fg=YELLOW,
+                                      font=FONT_CODE, anchor="w", justify="left",
+                                      wraplength=max(180, self.win_w - 28), cursor="hand2")
+        self.mini_lbl_cost.pack(fill="x", padx=10, pady=(0, 6))
+        self.mini_lbl_cost.bind("<Button-1>", self.on_cost_click)
+        self.mini_lbl_cost.bind("<Button-3>", self.on_cost_right)
+
+        # 初始打包与尺寸
+        if self.mini_mode:
+            self.frm_mini.pack(fill="both", expand=True)
+            self.root.geometry("%dx%d+%d+60" % (self.win_w, max(86, self.mini_h), sw - self.win_w - 20))
+        else:
+            self.frm_full.pack(fill="both", expand=True)
+            self.root.geometry("%dx%d+%d+60" % (self.win_w, max(280, self.full_h), sw - self.win_w - 20))
+
+        # 监听窗口拖拽尺寸调整（自适应换行并记忆）
+        self.root.bind("<Configure>", self.on_window_resize)
+
+        # 双击任意控件快速切换极简/完整模式
+        for w in (self.root, self.frm_full, self.frm_mini, self.lbl_title, self.lbl_rate,
+                  self.lbl_detail, self.mini_lbl_rate, self.mini_lbl_tokens, self.mini_lbl_cost):
+            w.bind("<Double-Button-1>", lambda _e: self.toggle_mini_mode())
+
+        # 右键菜单（窗口任意处）：成本统计 / 价格表管理
+        self.menu = tk.Menu(self.root, tearoff=0)
+        self.menu.add_command(label="🗕 切换精简/完整模式", command=self.toggle_mini_mode)
+        self.menu.add_command(label="成本统计…", command=self.open_stats)
+        self.menu.add_command(label="价格表管理…", command=self.on_cost_right)
+        self.menu.add_command(label="🔄 重新对齐对话", command=self.do_refresh)
+        self.menu.add_command(label="⚖ 重新加载站方校准", command=self.on_calib_click)
+        self.menu.add_command(label="⚡ 从中转站实扣同步价格表", command=self.do_sync_proxy_prices)
+        self.menu.add_command(label="🌐 打开网页看板 (8788)", command=self.open_web_panel)
+        # 思考档位（新增）
+        self.menu_effort = tk.Menu(self.menu, tearoff=0)
+        self.menu.add_cascade(label="思考档位…", menu=self.menu_effort)
+        # 提示注入（新增）：一级子菜单挂各预设，点预设直接确认注入
+        self.menu_hint = tk.Menu(self.menu, tearoff=0)
+        self.menu.add_cascade(label="提示注入…", menu=self.menu_hint)
+        # 透明度调节
+        self.menu_alpha = tk.Menu(self.menu, tearoff=0)
+        for a_val, a_label in ((1.0, "100% (不透明)"), (0.90, "90% (推荐磨砂)"), (0.80, "80% (半透明)"), (0.70, "70% (高透明)")):
+            self.menu_alpha.add_command(label=a_label, command=lambda v=a_val: self.set_alpha(v))
+        self.menu.add_cascade(label="透明度…", menu=self.menu_alpha)
+        self.menu.add_separator()
+        self.menu.add_command(label="退出程序", command=self.exit_app)
+        self.root.bind("<Button-3>", self.on_root_right)
+        self._last_settle = 0.0
+
+        # 点击右上角 ✕ 拦截：隐藏到系统托盘区，不退出
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close_to_tray)
+
+        # 初始化 Windows 系统托盘（隐藏图标区）
+        self.tray_icon = None
+        self._init_tray()
+
+        self.tick()
+
+    # -------- 系统托盘（任务栏隐藏图标）--------
+    def _init_tray(self):
+        """初始化 Windows 任务栏系统托盘图标。"""
+        try:
+            import pystray
+            from PIL import Image, ImageDraw
+            import io, base64
+
+            if _ICON_B64:
+                try:
+                    img = Image.open(io.BytesIO(base64.b64decode(_ICON_B64)))
+                except Exception:
+                    img = None
+            else:
+                img = None
+
+            if not img:
+                img = Image.new("RGBA", (32, 32), (0, 0, 0, 0))
+                d = ImageDraw.Draw(img)
+                d.rectangle((4, 4, 28, 28), fill="#4ade80")
+
+            def _on_show(icon, item):
+                self.root.after(0, self.show_from_tray)
+
+            def _on_toggle(icon, item):
+                self.root.after(0, self.toggle_mini_mode)
+
+            def _on_stats(icon, item):
+                self.root.after(0, self.open_stats)
+
+            def _on_exit(icon, item):
+                self.root.after(0, self.exit_app)
+
+            menu = pystray.Menu(
+                pystray.MenuItem("显示悬浮窗", _on_show, default=True),
+                pystray.MenuItem("🗕 切换精简/完整模式", _on_toggle),
+                pystray.MenuItem("📊 成本统计…", _on_stats),
+                pystray.Menu.SEPARATOR,
+                pystray.MenuItem("退出程序", _on_exit),
+            )
+
+            self.tray_icon = pystray.Icon("HermesCacheMonitor", img, "缓存跟随监控", menu)
+            self.tray_icon.run_detached()
+        except Exception as e:
+            _startup_log("托盘初始化失败：%s" % e)
+
+    def on_close_to_tray(self):
+        """点击右上角 ✕ 时隐藏到隐藏图标区，不退出程序。"""
+        self.root.withdraw()
+
+    def show_from_tray(self):
+        """从托盘恢复窗口显示并置顶。"""
+        self.root.deiconify()
+        self.root.lift()
+        self.root.attributes("-topmost", True)
+
+    def exit_app(self):
+        """彻底退出程序（清理托盘与后台守护）。"""
+        try:
+            if self.tray_icon:
+                self.tray_icon.stop()
+        except Exception:
+            pass
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
+        os._exit(0)
+
+    # -------- 交互 --------
+    def set_alpha(self, val):
+        self.alpha = float(val)
+        try:
+            self.root.attributes("-alpha", self.alpha)
+        except Exception:
+            pass
+        cfg = load_config()
+        cfg["alpha"] = self.alpha
+        save_config(cfg)
+        self._flash("透明度已设为 %d%%" % int(self.alpha * 100))
+
+    def on_window_resize(self, ev):
+        """用户拖拽改变窗口大小时：记忆尺寸并动态调整文字折行宽度。"""
+        if ev.widget != self.root:
+            return
+        w = ev.width
+        h = ev.height
+        if w < 100 or h < 30:
+            return
+
+        self.win_w = w
+        if self.mini_mode:
+            self.mini_h = h
+        else:
+            self.full_h = h
+
+        # 动态自适应文字折行宽度
+        wrap_val = max(180, w - 28)
+        try:
+            self.lbl_title.config(wraplength=max(140, w - 60))
+            self.lbl_detail.config(wraplength=wrap_val)
+            self.lbl_cost.config(wraplength=wrap_val)
+            self.lbl_warn.config(wraplength=wrap_val)
+            self.mini_lbl_tokens.config(wraplength=max(100, w - 120))
+            self.mini_lbl_cost.config(wraplength=wrap_val)
+        except Exception:
+            pass
+
+    def toggle_mini_mode(self, force=None):
+        if force is not None:
+            self.mini_mode = force
+        else:
+            self.mini_mode = not self.mini_mode
+
+        try:
+            cur_x = self.root.winfo_x()
+            cur_y = self.root.winfo_y()
+        except Exception:
+            cur_x = self.root.winfo_screenwidth() - self.win_w - 20
+            cur_y = 60
+
+        cfg = load_config()
+        cfg["mini_mode"] = self.mini_mode
+        cfg["win_w"] = self.win_w
+        cfg["full_h"] = self.full_h
+        cfg["mini_h"] = self.mini_h
+        save_config(cfg)
+
+        # 保持当前宽度不重置，高度恢复为对应模式的记忆高度
+        target_w = max(300, self.win_w)
+        if self.mini_mode:
+            self.frm_full.pack_forget()
+            self.frm_mini.pack(fill="both", expand=True)
+            target_h = max(86, self.mini_h)
+            self.root.geometry("%dx%d+%d+%d" % (target_w, target_h, cur_x, cur_y))
+        else:
+            self.frm_mini.pack_forget()
+            self.frm_full.pack(fill="both", expand=True)
+            target_h = max(280, self.full_h)
+            self.root.geometry("%dx%d+%d+%d" % (target_w, target_h, cur_x, cur_y))
+
+        if self.last_d:
+            try:
+                self.render(self.last_d)
+            except Exception:
+                pass
+
+    def on_root_right(self, ev):
+        try:
+            self.show_effort_menu()
+        except Exception:
+            pass
+        try:
+            self.show_hint_menu()
+        except Exception:
+            pass
+        try:
+            self.menu.tk_popup(ev.x_root, ev.y_root)
+        finally:
+            self.menu.grab_release()
+
+    def do_sync_proxy_prices(self):
+        """从中转站真实流水一键反推并写入价格表。"""
+        ok, msg = sync_prices_from_proxy(self.mon.prices)
+        self._flash(msg, is_err=(not ok))
+        self.mon.last_info_at = 0
+
+    def open_web_panel(self):
+        """按需拉起中转看板并在默认浏览器打开（平时不常驻占用内存）。"""
+        import webbrowser, urllib.request, subprocess
+        running = False
+        try:
+            with urllib.request.urlopen("http://127.0.0.1:8788/", timeout=1) as resp:
+                if resp.status == 200:
+                    running = True
+        except Exception:
+            running = False
+
+        if not running:
+            pm = _get_proxy_monitor_dir()
+            flags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+            py_exe = "pyw" if os.system("where pyw >nul 2>&1") == 0 else "python"
+            subprocess.Popen([py_exe, "panel.py", "--port", "8788"], cwd=pm,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             creationflags=flags)
+            time.sleep(0.5)
+
+        webbrowser.open("http://127.0.0.1:8788")
+        self._flash("已在浏览器打开中转看板")
+
+    # -------- 思考档位（新增） --------
+    def on_footer_click(self, ev):
+        """左键点底部状态行 → 弹档位菜单。"""
+        try:
+            self.show_effort_menu()
+        except Exception:
+            return
+        try:
+            self.menu_effort.tk_popup(ev.x_root, ev.y_root)
+        finally:
+            try:
+                self.menu_effort.grab_release()
+            except Exception:
+                pass
+
+    def show_effort_menu(self):
+        """每次弹出前重建子菜单，让当前档位打勾。"""
+        cur, path = read_effort()
+        try:
+            self.menu_effort.delete(0, "end")
+        except Exception:
+            pass
+        if not path:
+            self.menu_effort.add_command(label="（未找到 config.yaml）", state="disabled")
+            return
+        for val, name in EFFORT_LEVELS:
+            mark = "✓ " if val == (cur or "") else "   "
+            self.menu_effort.add_command(
+                label="%s%s" % (mark, name),
+                command=(lambda v=val: self.switch_effort(v)))
+
+    def switch_effort(self, level):
+        """带确认框的档位切换。"""
+        cur, _ = read_effort()
+        if (cur or "") == (level or ""):
+            return
+        msg = "确定把思考档位切到「%s」？\n\n当前：%s\n（立即生效，所有对话通用）" % (
+            effort_label(level), effort_label(cur))
+        if level in EFFORT_RISKY:
+            msg += "\n\n⚠ 该档位在部分中转站会被拒绝（报 400）\n换模型后才可能生效。"
+        if not messagebox.askokcancel("思考档位", msg, parent=self.root):
+            return
+        ok, info = write_effort(level)
+        if ok:
+            messagebox.showinfo("思考档位", "%s\n\n已立即生效。" % info, parent=self.root)
+        else:
+            messagebox.showerror("思考档位", info, parent=self.root)
+
+    def open_stats(self):
+        self._stats.append(StatsDialog(self.root, self.mon, on_close=self._stats_closed))
+
+    # -------- 提示注入（新增） --------
+    def show_hint_menu(self):
+        """每次弹出前重建子菜单：当前生效的预设打 ●。"""
+        try:
+            store = HintStore()
+            store.load()
+            cur = store.current_active()
+            presets = store.list_presets()
+        except Exception:
+            return
+        try:
+            self.menu_hint.delete(0, "end")
+        except Exception:
+            pass
+        self.menu_hint.add_command(label="打开管理…", command=self.open_hint)
+        self.menu_hint.add_separator()
+        if not presets:
+            self.menu_hint.add_command(label="（还没有预设）", state="disabled")
+            return
+        for p in presets:
+            name = p.get("name") or ""
+            mark = "● " if name == cur else "   "
+            self.menu_hint.add_command(
+                label="%s%s" % (mark, name),
+                command=(lambda pr=p: apply_hint_preset_direct(pr, self.root)))
+
+    def open_hint(self):
+        """单例打开管理窗（已开着就抬起来）。"""
+        d = self._hint_dlg
+        if d is not None:
+            try:
+                if d.win.winfo_exists():
+                    d.win.lift()
+                    return
+            except Exception:
+                pass
+        try:
+            self._hint_dlg = HintDialog(self.root, on_changed=self._hint_changed)
+        except Exception as e:
+            messagebox.showerror("提示注入", "打开失败：%s" % e, parent=self.root)
+
+    def _hint_changed(self):
+        """注入/恢复后：让状态行缓存立刻失效。"""
+        _HINT_CACHE["t"] = 0.0
+        _HINT_CACHE["v"] = ""
+        _HINT_CACHE["present"] = False
+
+    # -------- 刷新 / 重新对齐（新增） --------
+    def _flash(self, text, warn=False, secs=8.0):
+        """状态行临时反馈，几秒后自动消失。"""
+        self._flash_msg = (text, time.time() + secs, warn)
+        self._render_footer()
+
+    def do_refresh(self, _ev=None):
+        """手动刷新：强制清锁 + 同步重跑三级信号 + 强制重载校准 + 立即重渲染。"""
+        if hasattr(self.mon, "calib_mgr"):
+            self.mon.calib_mgr.load(force=True)
+        try:
+            hit = self.mon.refresh_follow()
+        except Exception:
+            hit = None
+        self.mon.last_info_at = 0.0
+        try:
+            d = self.mon.current(include_gap=self.include_gap)
+        except Exception:
+            d = None
+        self.last_d = d
+        try:
+            self.render(d)
+        except Exception:
+            pass
+        # ⚠ 先登记当前 sid：否则下一轮 tick 会认为「对话变了」而把刚设的提示清掉
+        self._last_sid_shown = (d or {}).get("sid")
+        sid = (hit or {}).get("sid")
+        via = (hit or {}).get("via")
+        if sid and d:
+            title = (d.get("title") or ("会话 " + sid[-6:]))
+            self._flash("✓ 已对齐：%s（%s）" % (title[:18], via))
+        elif sid:
+            self._flash("✓ 已对齐会话 %s（%s，暂无数据）" % (sid[-6:], via))
+        else:
+            self._flash("⚠ 没检测到当前对话（UIA/history/SMU 都没读到）", warn=True)
+        _startup_log("手动刷新：sid=%s via=%s title=%s" % (
+            sid, via, (d or {}).get("title")))
+
+    def on_calib_click(self, _ev=None):
+        """手动点击校准：定向极速刷新当前对话站点，拉取最新流水并重新对齐当前对话。"""
+        d = self.last_d or {}
+        st = d.get("site")
+        target_sites = []
+        if st and st != "?":
+            target_sites.append(canon_host(st))
+        calib = d.get("calib") or {}
+        for s in calib.get("sites") or []:
+            cs = canon_host(s)
+            if cs and cs != "?" and cs not in target_sites:
+                target_sites.append(cs)
+
+        site_hint = "（%s）" % "、".join(target_sites) if target_sites else ""
+        self._flash("正在连接中转站极速刷新%s…" % site_hint)
+
+        def _worker():
+            ok, msg = trigger_proxy_refresh(sites=target_sites, timeout=15.0)
+
+            def _done():
+                res = None
+                if hasattr(self.mon, "calib_mgr"):
+                    res = self.mon.calib_mgr.load(force=True)
+                cnt = len((res or {}).get("sessions", {}))
+                cur_sid = (self.last_d or {}).get("sid") or getattr(self.mon, "last_sid", None) or getattr(self.mon, "cur_sid", None)
+                hit = (res or {}).get("sessions", {}).get(cur_sid) if (res and cur_sid) else None
+                if hit:
+                    cost = hit.get("cost", 0.0)
+                    self._flash("✓ 已匹配站方最新数据：实扣 ¥%.4f" % cost)
+                elif ok:
+                    self._flash("✓ 站方用量已刷新（当前会话暂无新流水）")
+                else:
+                    self._flash("⚠ 站方刷新失败：%s" % msg, warn=True)
+                self.mon.last_info_at = 0.0
+                try:
+                    d = self.mon.current(include_gap=self.include_gap)
+                except Exception:
+                    d = None
+                self.last_d = d
+                try:
+                    self.render(d)
+                except Exception:
+                    pass
+
+            try:
+                self.root.after(0, _done)
+            except Exception:
+                pass
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _render_footer(self):
+        """状态行：正常显示实时状态；有临时反馈时优先显示反馈（几秒）。"""
+        fm = self._flash_msg
+        if fm and time.time() < fm[1]:
+            self.lbl_footer.config(text=fm[0], fg=(RED if fm[2] else GREEN))
+            return
+        if fm:
+            self._flash_msg = None
+        src = (self.last_d or {}).get("source", "")
+        try:
+            _eff, _ = read_effort_cached()
+        except Exception:
+            _eff = ""
+        try:
+            _ht, _hpresent, _ = read_hint_cached()
+            _hname = "无" if not _hpresent else ("%d字" % len(_ht))
+        except Exception:
+            _hname = "--"
+        self.lbl_footer.config(
+            text="更新 %s · %s · 档位:%s · 注入:%s ▾" % (
+                datetime.now().strftime("%H:%M:%S"), src,
+                effort_label(_eff), _hname), fg=DIM)
+
+    def _stats_closed(self, dlg):
+        try:
+            self._stats.remove(dlg)
+        except ValueError:
+            pass
+
+    def _set_include_gap(self, val):
+        self.include_gap = bool(val)
+        if self.mon.last_info is not None:
+            self.mon.last_info["include_gap"] = self.include_gap
+            self.mon.last_info_at = 0  # 立即重算
+
+    def on_gap_click(self, _ev=None):
+        if not (self.last_d or {}).get("report", {}).get("gap"):
+            return
+        self._set_include_gap(not self.include_gap)
+        self.render(self.last_d)
+
+    def on_gap_detail(self, _ev=None):
+        d = self.last_d
+        if not d or not (d.get("report") or {}).get("gap"):
+            return
+        GapDialog(self.root, self.mon, d)
+
+    def on_cost_click(self, _ev=None):
+        d = self.last_d
+        if not d:
+            return
+        host = d.get("site") or ""
+        model = d.get("model") or ""
+        entry = d.get("price_entry")
+        if entry and entry.get("model") not in ("*", None, "") and entry.get("model") != model:
+            entry = None
+        PriceDialog(self.root, self.mon.prices, host, model,
+                    on_saved=self._price_saved, entry=entry)
+
+    def on_cost_right(self, _ev=None):
+        d = self.last_d or {}
+        PriceManager(self.root, self.mon.prices, on_changed=self._price_saved,
+                     cur_host=d.get("site"), cur_model=d.get("model"))
+
+    def _price_saved(self):
+        self.mon.last_info_at = 0
+        if self.mon.last_info is not None:
+            self.mon.last_info_at = 0
+        self.mon.prices.load(force=True)
+        # 已打开的统计窗口：立刻热重载价格并重绘（不等 2 秒定时器）
+        for dlg in list(self._stats):
+            try:
+                dlg.notify_prices_changed()
+            except Exception:
+                pass
+
+    # -------- 渲染 --------
+    def render(self, d):
+        if d is None:
+            self.lbl_title.config(text="(无活动对话)")
+            self.lbl_rate.config(text="--", fg=DIM)
+            self.lbl_detail.config(text="")
+            self.lbl_cost.config(text="")
+            self.lbl_gap.config(text="")
+            try:
+                self.mini_lbl_rate.config(text="--", fg=DIM)
+                self.mini_lbl_tokens.config(text="")
+                self.mini_lbl_cost.config(text="(无活动对话)")
+            except Exception:
+                pass
+            self.last_d = None
+            return
+        title = d.get("title") or ("会话 " + d["sid"][-6:])
+        self.lbl_title.config(text="▶ %s" % title[:34])
+        if d["rate"] is None:
+            self.lbl_rate.config(text="--", fg=DIM)
+        else:
+            color = GREEN if d["rate"] >= 80 else (YELLOW if d["rate"] >= 50 else RED)
+            self.lbl_rate.config(text="%.1f%%" % d["rate"], fg=color)
+
+        rep = d.get("report") or {}
+        cov = ""
+        if rep:
+            if rep.get("partial"):
+                cov = " ｜ 账目 --（日志未覆盖）"
+            else:
+                cov = " ｜ 账目 %d/%d 次%s" % (rep.get("recorded", 0), rep.get("real", 0),
+                                            "~" if rep.get("concurrent") else "")
+        offset = d.get("calib_offset") if getattr(self, "use_calibration", True) else None
+        if offset and offset.get("has_calib"):
+            diff_cr = offset.get("diff_cr", 0)
+            diff_inp = offset.get("diff_inp", 0)
+            c_cr = d["cr"] + diff_cr
+            c_inp = d["inp"] + diff_inp
+        else:
+            c_cr = d["cr"]
+            c_inp = d["inp"]
+
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        cur_sites = []
+        host_main = canon_host(d.get("site")) if d.get("site") and d["site"] != "?" else None
+        if host_main:
+            cur_sites.append(host_main)
+        else:
+            # 仅在主站点未知时才尝试校准记录中的推测站点
+            calib_raw = d.get("calib") or {}
+            for s in calib_raw.get("sites") or []:
+                cs = canon_host(s)
+                if cs and cs != "?" and cs not in cur_sites:
+                    cur_sites.append(cs)
+
+        site_items = []
+        for s in cur_sites:
+            st_data = self.mon.calib_mgr.get_daily_calib(today_str, s) if hasattr(self.mon, "calib_mgr") else None
+            # 站点短名（更干净，不占行宽）
+            s_short = s.replace(".xin", "").replace("api.", "").replace(".icu", "")
+            if st_data and st_data.get("cost") is not None:
+                site_items.append("[● %s · ¥%.2f (%d次)]" % (s_short, st_data["cost"], st_data.get("calls", 0)))
+            else:
+                site_items.append("[● %s]" % s_short)
+        site_str = "  ".join(site_items) if site_items else d["site"]
+
+        self.lbl_detail.config(text="缓存 %s / 未命中 %s ｜ %s 次调用\n%s%s" % (
+            fmt_vol(c_cr), fmt_vol(c_inp), d["calls"], site_str, (" " + cov if cov else "")))
+
+        # 成本行
+        priced = d.get("priced")
+        ch = d.get("children") or {}
+        if priced is None:
+            self.lbl_cost.config(text="⚙ 价格未配置 · 点此填写", fg=DIM)
+        elif priced.get("free"):
+            extra = ""
+            if ch.get("count"):
+                extra = " ｜ 子%d %s" % (ch["count"],
+                                       "免费" if not ch["cost"] else fmt_money(ch["cost"], ch["cur"]))
+            self.lbl_cost.config(text="≈ 免费%s · 缓存省 %s" % (
+                extra, fmt_money(priced["saved"], priced["cur"])), fg=GREEN)
+        else:
+            base_cost = priced["cost"]
+            ch_cost = ch.get("cost") or 0.0
+            hermes_total = base_cost + ch_cost
+            cur = priced["cur"]
+
+            # 用户新规则：
+            # hermes检测数据 + 同步后补差价的数据（不再刷新，直到下次同步）= 最终价格 (已校准)
+            if offset and offset.get("has_calib"):
+                diff_cost = offset.get("diff_cost", 0.0)
+                final_cost = hermes_total + diff_cost
+                if diff_cost >= 0.0001:
+                    cost_head = "≈ %s + 补差 %s = %s (已校准)" % (
+                        fmt_money(hermes_total, cur), fmt_money(diff_cost, cur), fmt_money(final_cost, cur))
+                else:
+                    cost_head = "≈ %s (已校准)" % fmt_money(final_cost, cur)
+            else:
+                cost_head = "≈ %s" % fmt_money(hermes_total, cur)
+
+            tail = ""
+            if ch.get("count"):
+                tail = " ｜ 子%d %s" % (ch["count"], fmt_money(ch["cost"], ch["cur"]))
+                if ch.get("unpriced"):
+                    tail += "（%d 未配价）" % ch["unpriced"]
+            gp = ""
+            est = d.get("estimate") or {}
+            if self.include_gap and est.get("cost"):
+                gp = " + 缺账 %s" % fmt_money(est["cost"], priced["cur"])
+            tag = ""
+            if priced.get("period"):
+                tag = " [%s]" % priced["period"]
+            self.lbl_cost.config(text="%s%s · 缓存省 %s%s%s" % (
+                cost_head, tag,
+                fmt_money(priced["saved"], priced["cur"]), tail, gp))
+
+        # 缺账行
+        if rep and rep.get("gap"):
+            est = d.get("estimate") or {}
+            if est:
+                txt = "⚠ 缺账 %d · 估 +%s in / +%s out" % (
+                    rep["gap"], fmt_vol(est["in"]), fmt_vol(est["out"]))
+            else:
+                txt = "⚠ 缺账 %d · 无锚点可估" % rep["gap"]
+            txt += " ｜ %s" % ("已计入" if self.include_gap else "未计入")
+            self.lbl_gap.config(text=txt)
+            self.lbl_gap_detail.config(text="明细 ▸")
+        else:
+            self.lbl_gap.config(text="")
+            self.lbl_gap_detail.config(text="")
+
+        # 同步更新迷你模式控件
+        try:
+            rate_txt = self.lbl_rate.cget("text")
+            rate_fg = self.lbl_rate.cget("fg")
+            self.mini_lbl_rate.config(text=rate_txt, fg=rate_fg)
+            self.mini_lbl_tokens.config(text="缓存 %s / 未命中 %s" % (fmt_vol(c_cr), fmt_vol(c_inp)))
+            self.mini_lbl_cost.config(text=self.lbl_cost.cget("text"))
+        except Exception:
+            pass
+
+    def tick(self):
+        # 智能静止休眠：若窗口最小化或不可见，直接 3 秒后重试，跳过所有重绘与计算
+        try:
+            if not self.root.winfo_viewable() or self.root.state() == "iconic":
+                self.root.after(3000, self.tick)
+                return
+        except Exception:
+            pass
+
+        _t0 = time.perf_counter()
+        # 自动感知校准文件更新（后台 5 分钟轮询导出后秒级热同步）
+        if hasattr(self.mon, "calib_mgr"):
+            mgr = self.mon.calib_mgr
+            p = mgr._resolve_path()
+            if p:
+                try:
+                    m = os.path.getmtime(p)
+                    if m != mgr._mtime:
+                        mgr.load(force=True)
+                        self.mon.last_info_at = 0.0
+                except Exception:
+                    pass
+        try:
+            d = self.mon.current(include_gap=self.include_gap)
+        except Exception:
+            d = None
+        self.last_d = d
+        _t1 = time.perf_counter()
+        try:
+            self.render(d)
+        except Exception:
+            pass
+        _t2 = time.perf_counter()
+        # 对话切换 → 先清掉上一次的临时反馈（避免旧提示挂在状态行上误导），再渲染状态行
+        _now_sid = (d or {}).get("sid")
+        if _now_sid != getattr(self, "_last_sid_shown", None):
+            self._last_sid_shown = _now_sid
+            self._flash_msg = None
+        self._render_footer()
+        # 日账本：跨日结算（限流 60 秒）
+        now_t = time.time()
+        if now_t - self._last_settle > 60:
+            self._last_settle = now_t
+            try:
+                self.mon.cost_ledger.maybe_settle()
+            except Exception:
+                pass
+        _t3 = time.perf_counter()
+        if _PROFILE:
+            ms = ((_t1 - _t0) * 1000, (_t2 - _t1) * 1000, (_t3 - _t2) * 1000)
+            if max(ms) > 30:      # 只记慢的，避免日志刷屏
+                # ⚠ 原来这里用的是未定义的名字 `src`（tick 里从未赋值）→ NameError 被外层
+                # except 吞掉，于是 --profile 慢日志自 2026-09-14 起一行都写不出来。
+                # 诊断工具自己失效是最坑的，改成从 d 取 source。
+                _src = (d or {}).get("source", "-")
+                try:
+                    with open(os.path.join(WORK_DIR, "tick_profile.log"),
+                              "a", encoding="utf-8") as f:
+                        f.write("%s  跟随 %.1fms ｜ 渲染 %.1fms ｜ 结算 %.1fms ｜ "
+                                "src=%s sid=%s\n" % (
+                                    datetime.now().strftime("%H:%M:%S"), ms[0], ms[1], ms[2],
+                                    _src, (d or {}).get("sid", "-")))
+                except Exception:
+                    pass
+        self.root.after(REFRESH_MS, self.tick)
+
+    def run(self):
+        self.root.mainloop()
+
+
+# ─────────────────────────── 入口 ───────────────────────────
+
+def _dump(m, d):
+    """调试输出：把展示数据打成文本。"""
+    if not d:
+        print("no data")
+        return
+    print("sid:    ", d["sid"])
+    print("title:  ", d["title"])
+    print("site:   ", d["site"])
+    print("model:  ", d["model"])
+    print("calls:  ", d["calls"])
+    print("cache:  %s / miss: %s / out: %s" % (
+        fmt_vol(d["cr"]), fmt_vol(d["inp"]), fmt_vol(d["out"])))
+    print("rate:   %.1f%%" % d["rate"] if d["rate"] is not None else "rate:   n/a")
+    p = d.get("priced")
+    if p is None:
+        print("price:   未配置")
+    elif p.get("free"):
+        print("price:   免费 ｜ 缓存省 %s" % fmt_money(p["saved"], p["cur"]))
+    else:
+        print("price:   ≈ %s%s ｜ 缓存省 %s" % (
+            fmt_money(p["cost"] + (d.get("children") or {}).get("cost", 0), p["cur"]),
+            (" [%s]" % p["period"]) if p.get("period") else "",
+            fmt_money(p["saved"], p["cur"])))
+    ch = d.get("children") or {}
+    print("children: %d 个（%s，其中未配价 %d）" % (
+        ch.get("count", 0), fmt_money(ch.get("cost", 0), ch.get("cur", "¥")),
+        ch.get("unpriced", 0)))
+    rep = d.get("report")
+    if rep:
+        mark = "（日志未覆盖全程）" if rep.get("partial") else (
+            "（并发时段，归属近似）" if rep.get("concurrent") else "")
+        print("ledger: 真实 %d / 记账 %d / 缺账 %d%s" % (
+            rep["real"], rep["recorded"], rep["gap"], mark))
+        if rep.get("inflight"):
+            print("        进行中 %s（等待记账 → 不算缺账）" % rep["inflight"])
+        for ts, kind in m._gap_types(d["sid"], rep)[:12]:
+            print("        缺账 %s  %s" % (ts, kind))
+    est = d.get("estimate")
+    if est:
+        print("estimate: +%s in（未命中 %s / 命中 %s） / +%s out%s" % (
+            fmt_vol(est["in"]), fmt_vol(est["miss"]), fmt_vol(est["hit"]),
+            fmt_vol(est["out"]),
+            ("  ≈ %s" % fmt_money(est["cost"])) if est.get("cost") is not None else ""))
+    print("source: ", d["source"])
+
+
+def _dump_stats(cl, win):
+    """文本形式打印成本统计（对应 GUI「成本统计」窗口，调试/无人值守用）。"""
+    agg, src = cl.report(win)
+    rows = {}
+    for key, v in (agg or {}).items():
+        host, model = key.split("|", 1)
+        r = rows.setdefault((host, model), {
+            "calls": 0, "in": 0, "hit": 0, "out": 0, "cost": 0.0,
+            "unpriced": False, "unpriced_hist": False})
+        for f in ("calls", "in", "hit", "out"):
+            r[f] += v.get(f) or 0
+        r["cost"] += v.get("cost") or 0
+        r["unpriced"] = r["unpriced"] or bool(v.get("unpriced"))
+        r["unpriced_hist"] = r["unpriced_hist"] or bool(v.get("unpriced_hist"))
+    total = sum(r["cost"] for r in rows.values())
+    print("[统计] 窗口=%s 来源=%s 条目=%d 合计=%s" % (win, src, len(rows), fmt_money(total)))
+    for (host, model), r in sorted(rows.items(), key=lambda kv: -kv[1]["calls"]):
+        tot_in = r["in"] + r["hit"]
+        rate = (r["hit"] * 100.0 / tot_in) if tot_in else 0.0
+        flag = []
+        if r["unpriced"]:
+            flag.append("未配价")
+        if r["unpriced_hist"]:
+            flag.append("历史缺价")
+        # 没配价的条目金额列显示 "--"，别显示 ¥0.0000（容易被误读成「免费」）
+        cost_s = fmt_money(r["cost"]) if not (flag and not r["cost"]) else "--"
+        print("  %-26s %-24s %7d %6.1f%% %12s  %s" % (
+            host[:26], (model or "*")[:24], r["calls"], rate,
+            cost_s, "+".join(flag) or "-"))
+    # 锚点对照：站方实付 vs 本表估算（并反推整体倍率）
+    for b in (cl.data.get("bills") or []):
+        rb = cl.resolve_bill(b)
+        ours = sum(v["cost"] for (h, _m), v in rows.items() if h == b["host"])
+        k = (rb["amount"] / ours) if ours else 0
+        print("  [锚点] %-20s 本表估算 %8.2f ｜ 站方实付 %8.2f ｜ k=%.4f（差 %+.1f%%）" % (
+            b["host"], ours, rb["amount"], k, (k - 1) * 100 if ours else 0))
+        for sr in (rb.get("seg_rows") or []):
+            print("           段 %-12s 估算 %8.2f ｜ 分摊实付 %8.2f ｜ k=%.4f" % (
+                sr["seg_from"] or "(最早)", sr["est"], sr.get("amount_share") or 0,
+                sr.get("k_share") or 0))
+    return rows
+
+
+def _dump_segments(pb):
+    """打印价格表的分段情况（时间轴）。"""
+    print("[价格表] %d 条" % len(pb.all()))
+    for e in pb.all():
+        head = "%s / %s" % (e.get("host"), e.get("model"))
+        ps = pb.segs(e)
+        if not ps:
+            r = e.get("ratio")
+            print("  %-46s 单段(全天)  in=%s out=%s cache=%s%s" % (
+                head, e.get("in"), e.get("out"), e.get("cache"),
+                ("  ratio=%s" % r) if r else ""))
+            continue
+        print("  %-46s %d 段（时间轴）:" % (head, len(ps)))
+        for p in ps:
+            r = p.get("ratio")
+            flag = " ⚡峰谷" if (p.get("peak") or p.get("off")) else ""
+            print("      from %-12s in=%-10s out=%-10s cache=%-10s%s%s%s" % (
+                p.get("from") or "(最早)", p.get("in"), p.get("out"), p.get("cache"),
+                ("  ratio=%s" % r) if r else "",
+                flag, "  周末全天闲时" if p.get("weekend_off") else ""))
+
+
+def _do_maint(m, args):
+    """无 GUI 的维护动作。
+
+    --segments              打印价格表分段
+    --recompute [day|missing|all]
+    --stats [24h|today|7d|30d|all]
+    --bill-file <json>      导入实付锚点（单对象或数组）
+    --bills                 列出锚点 + 反解
+    --resolve               额外打印逐项明细
+    --bill-del host|model|from|to
+    """
+    cl = m.cost_ledger
+    done = []
+    if "--segments" in args:
+        _dump_segments(m.prices)
+        done.append("segments")
+    if "--bill-file" in args:
+        i = args.index("--bill-file")
+        path = args[i + 1] if i + 1 < len(args) else ""
+        with open(path, "r", encoding="utf-8-sig") as f:
+            data = json.load(f)
+        items = data if isinstance(data, list) else [data]
+        for b in items:
+            rec = cl.add_bill(b)
+            print("[锚点] 录入 %s / %s  %s~%s  %s%s%s" % (
+                rec["host"], rec["model"], rec["from"] or "-", rec["to"] or "-",
+                rec["cur"], rec["amount"],
+                ("  备注: %s" % rec["note"]) if rec["note"] else ""))
+        done.append("bills")
+    if "--bill-del" in args:
+        i = args.index("--bill-del")
+        spec = args[i + 1] if i + 1 < len(args) else ""
+        parts = (spec.split("|") + ["", "", "", ""])[:4]
+        n = cl.del_bill(parts[0], parts[1] or "*", parts[2], parts[3])
+        print("[锚点] 已删除，剩余 %d 条" % n)
+        done.append("bills")
+    if "--bills" in args or "--resolve" in args:
+        bills = cl.data.get("bills") or []
+        if not bills:
+            print("[锚点] 还没有录入实付账单（用 --bill-file 导入，或在统计窗口里点「录入实付」）")
+        for b in bills:
+            r = cl.resolve_bill(b)
+            print("\n[锚点] %s / %s   %s ~ %s   %s" % (
+                b["host"], b["model"], b["from"] or "-", b["to"] or "-",
+                b.get("added") or ""))
+            print("   token 来源=%s  miss=%d 缓存=%d 输出=%d" % (
+                r["tokens_src"], r["tokens"]["miss"], r["tokens"]["cache"], r["tokens"]["out"]))
+            print("   估算 %s%.2f ｜ 实付 %s%.2f ｜ 整体倍率 k=%.4f（差 %+.1f%%）" % (
+                r["cur"], r["est"], r["cur"], r["amount"],
+                r["k"] or 0, ((r["amount"] / r["est"] - 1) * 100) if r["est"] else 0))
+            for sr in (r.get("seg_rows") or []):
+                print("      · 段 %-12s 估算 %8.2f ｜ 按估算分摊实付 %8.2f ｜ k=%.4f" % (
+                    sr["seg_from"] or "(最早)", sr["est"], sr.get("amount_share") or 0,
+                    sr.get("k_share") or 0))
+            if "--resolve" in args and not r.get("seg_rows"):
+                for it in r["items"]:
+                    line = "      %-8s 单价=%-9s 估算 %8.2f" % (
+                        it["label"], it["price"], it["est"])
+                    if it["amount"] is not None:
+                        line += " ｜ 实付 %8.2f ｜ 真单价 %-9.5f ｜ k=%.4f" % (
+                            it["amount"], it["unit"] or 0, it["k"] or 0)
+                    print(line)
+        done.append("bills")
+    if "--recompute" in args:
+        i = args.index("--recompute")
+        mode = args[i + 1] if (i + 1 < len(args) and not args[i + 1].startswith("-")) else "day"
+        if mode not in ("day", "missing", "all"):
+            print("[重算] mode 只能是 day / missing / all")
+            raise SystemExit(4)
+        st = cl.recompute(mode)
+        print("[重算] 模式=%s 扫描=%d 算出金额=%d 仍缺价=%d 跳过=%d 数值变化=%d 峰谷按时段=%s" % (
+            st["mode"], st["scanned"], st["priced"], st["unpriced"], st["skipped"],
+            st.get("changed", 0), st.get("hm") or "当前钟点"))
+        done.append("recompute")
+    if "--stats" in args:
+        i = args.index("--stats")
+        win = args[i + 1] if (i + 1 < len(args) and not args[i + 1].startswith("-")) else "7d"
+        if win not in ("24h", "today", "7d", "30d", "all"):
+            print("[统计] 窗口只能是 24h / today / 7d / 30d / all")
+            raise SystemExit(4)
+        _dump_stats(cl, win)
+        done.append("stats")
+    return done
+
+
+def _force_utf8_output():
+    """把 stdout/stderr 切成 UTF-8。
+
+    ⚠ 为什么必须做：windowed exe 从中文控制台（cmd / PowerShell）启动时，
+    sys.stdout.encoding 是 GBK，而输出里有「¥」「·」等字符 → print 直接抛
+    UnicodeEncodeError 崩溃。实测 `HermesCacheMonitor.exe --once` 与 `--stats all`
+    双双崩掉（退出码 1），而 README 里正是这么教用户用的。
+    对已被 _ensure_output() 换成文件对象的 stdout 同样适用（那也是 TextIOWrapper）。
+    """
+    for name in ("stdout", "stderr"):
+        s = getattr(sys, name, None)
+        if s is None:
+            continue
+        try:
+            if hasattr(s, "reconfigure"):
+                s.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+
+def main():
+    _force_utf8_output()
+    args = sys.argv
+    headless = ("--once" in args or "--sid" in args
+                or "--recompute" in args or "--stats" in args
+                or "--segments" in args or "--bills" in args
+                or "--bill-file" in args or "--resolve" in args
+                or "--bill-del" in args)
+
+    # ① 路径解析（自动探测 / 配置文件 / 手动选择）
+    ok, msg = init_paths()
+    if not ok:
+        if headless:
+            print("[配置] %s" % msg)
+            found = scan_hermes_homes()
+            print("[配置] 扫描到 %d 个候选：" % len(found))
+            for c in found:
+                print("        ", c)
+            raise SystemExit(2)
+        picked = first_run_dialog(msg)
+        if not picked:
+            return
+        cfg = load_config()
+        cfg["hermes_home"] = picked
+        save_config(cfg)
+        ok, msg = init_paths(cfg)
+        if not ok:
+            messagebox.showerror("配置失败", msg)
+            return
+
+    # ② 兼容性检查
+    ok2, msg2 = check_schema()
+    if not ok2:
+        if headless:
+            logp = _ensure_output()
+            print("[兼容性] %s" % msg2)
+            if logp:
+                print("（输出已写入 %s）" % logp)
+            raise SystemExit(3)
+        messagebox.showerror("数据不兼容", "%s\n\n程序将退出。" % msg2)
+        return
+
+    if headless:
+        m = Monitor()
+        m.ledger.poll()
+        time.sleep(0.3)
+        m.ledger.poll()
+        # headless 也要推进跨日结算（原先只有 GUI 的 tick 才调，导致 CLI 重算拿旧钟点）
+        try:
+            m.cost_ledger.maybe_settle()
+        except Exception:
+            pass
+        logp = _ensure_output()        # windowed exe：把输出接到数据目录的 cli_output.log
+        print("[配置] hermes-home = %s" % HERMES_HOME)
+        print("[配置] 数据目录    = %s" % WORK_DIR)
+        if _DATA_SPLIT:
+            print("[警告] 发现第二份数据（MSIX 虚拟化目录）：%s" % _DATA_SPLIT)
+            print("       混用 python / py 会读写不同副本 → 命令行请统一用 py")
+        print("[配置] WebView2    = %s" % (HISTORY or "(未找到，已停用该信号)"))
+        if logp:
+            print("[配置] 完整输出同时写入 = %s" % logp)
+        print()
+        # 维护动作（重算历史 / 打印统计）优先，跑完即退
+        if _do_maint(m, args):
+            raise SystemExit(0)
+        if "--sid" in args:
+            i = args.index("--sid")
+            sid = args[i + 1] if i + 1 < len(args) else ""
+            d = m.build(sid) if sid else None
+        else:
+            d = m.current(include_gap=False)
+        _dump(m, d)
+        raise SystemExit(0)
+    App().run()
+
+
+if __name__ == "__main__":
+    main()

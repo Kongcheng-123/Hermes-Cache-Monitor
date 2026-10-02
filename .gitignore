@@ -1,0 +1,33 @@
+# Python 编译缓存
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# 运行期数据与数据库（保护个人对账记录）
+*.db
+*.db-wal
+*.db-shm
+*.log
+*.tmp
+
+# 本地个人凭据与价格表（请使用 *.example.json 模板）
+sites.json
+proxy_calibration.json
+cache_prices.json
+cost_ledger.json
+host_alias.json
+.env
+
+# 打包构建产物
+build/work/
+build/HermesCacheMonitor/
+dist/
+*.spec.bak
+
+# 编辑器与系统配置
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
