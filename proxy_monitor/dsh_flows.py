@@ -44,8 +44,16 @@ STORE = os.path.join(HERE, "store.db")
 #   · BASES 是【实际请求域名池】。主站 api.dshapi.icu 曾整站 TLS 挂掉，
 #     副站 api2.dshapi.icu 是同一账号的另一个入口（余额/用量/倍率一致）。
 #   即：换域名 ≠ 换站点，两者解耦。
-SITE = "api.dshapi.icu"
-BASES = ["https://api2.dshapi.icu", "https://api.dshapi.icu"]
+# 2026-10-04 改造：不再硬编码域名，全部从 sites.json 读（配置驱动）。
+#   配置里给 sub2api 站写 host / bases 即可；读不到时用占位符，不会崩。
+try:
+    from . import site_resolver as _sr
+except ImportError:
+    import site_resolver as _sr
+
+_S2 = _sr.default_sub2api_site()
+SITE = _sr.host_of(_S2) or "sub2api.example.com"
+BASES = _sr.bases_of(_S2) or ["https://api.example.com"]
 API = "/api/v1/usage"
 PAGE_SIZE = 1000          # 实测可给 1000，一次拉完最省事
 MAX_PAGES = 30            # 安全上限

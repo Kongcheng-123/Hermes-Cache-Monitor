@@ -3,8 +3,8 @@
    与旧 spec 的差异：
      - 显式收 comtypes 全子模块
    用法：
-     py -m PyInstaller "D:/Hermes works/build/HermesCacheMonitor.spec" ^
-        --distpath "D:/Hermes works/dist" --workpath "D:/Hermes works/build/work" --noconfirm
+     py -m PyInstaller "<项目目录>/build/HermesCacheMonitor.spec" ^
+        --distpath "<项目目录>/dist" --workpath "<项目目录>/build/work" --noconfirm
 """
 import os
 from PyInstaller.utils.hooks import collect_submodules

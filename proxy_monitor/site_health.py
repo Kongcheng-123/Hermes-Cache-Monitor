@@ -38,7 +38,7 @@ def ts_str(ts):
 
     ⚠️ 时区语义（2026-10-01 踩坑）：
       库里 ts 有两种来源，语义不同：
-        · NewAPI 站（d1api）：ts 是【标准 epoch】，用 CST 格式化即得北京时间
+        · NewAPI 站（NewAPI 类站）：ts 是【标准 epoch】，用 CST 格式化即得北京时间
         · dsh 站（dsh_flows.py）：它把 ts 统一存成【北京时间戳】（epoch + 8h），
           见 dsh_flows.norm() 的注释 —— 因为 session_join.req_ts() 约定
           「回退分支的 ts 已是北京时间戳，会 +8h」。

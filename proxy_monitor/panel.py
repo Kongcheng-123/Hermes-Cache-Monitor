@@ -199,6 +199,9 @@ def build_state():
         GROUP BY day, site ORDER BY day DESC, site LIMIT 40""" % (BUSINESS, NON_FLOW))
 
     try:
+        # ⚠️ 排序按「最后活动」倒序（最近的在最前），不再按花费倒序
+        #    （2026-10-03 用户要求）。LIMIT 30 现在是「最近 30 个有活动的会话」，
+        #    比原来的「花费 top30」更贴合"我现在在聊哪个"的用法。
         out["sessions"] = q(con, """
             SELECT f.session_id, COUNT(*) n,
                    SUM(u.in_tokens) i, SUM(u.cache_read) cr, SUM(u.out_tokens) o,
@@ -207,7 +210,7 @@ def build_state():
             FROM flow_sessions f JOIN usage_flows u
               ON u.site=f.site AND u.request_id=f.request_id
             WHERE f.session_id IS NOT NULL
-            GROUP BY f.session_id ORDER BY c DESC LIMIT 30""")
+            GROUP BY f.session_id ORDER BY last_ts DESC LIMIT 30""")
     except Exception:
         out["sessions"] = []
 

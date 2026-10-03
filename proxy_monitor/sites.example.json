@@ -1,20 +1,31 @@
 [
   {
     "name": "示例站点-NewAPI类",
+    "host": "api.your-newapi-site.com",
     "base_url": "https://api.your-newapi-site.com/v1",
     "hermes_providers": [
       "custom:your-provider-name"
     ],
+    "quota_per_cny": 500000,
+    "kind": "newapi",
     "enabled": true,
-    "note": "大部分第三方中转站均为 NewAPI，填入 base_url 和你在 Hermes 中配置的 provider 名称即可自动识别"
+    "label": "示例站 A",
+    "note": "大部分第三方中转站均为 NewAPI 架构。填入 base_url 和你在 Hermes 中配置的 provider 名称即可自动识别。quota_per_cny 一般保持 500000（1 美元 = 1 人民币口径），个别站不同就按站方 /api/status 里公开的值改。"
   },
   {
     "name": "示例站点-sub2api类",
+    "host": "api.your-sub2api-site.com",
     "base_url": "https://api.your-sub2api-site.com/v1",
+    "bases": [
+      "https://api.your-sub2api-site.com"
+    ],
     "hermes_providers": [
       "custom:your-sub2api-provider"
     ],
+    "quota_per_cny": 500000,
+    "kind": "sub2api",
     "enabled": false,
-    "note": "使用 sub2api 架构的中转站，支持直读日度统计或通过 dsh_auth.py 桥接导入网页登录态"
+    "label": "示例站 B",
+    "note": "使用 sub2api 架构的中转站。支持直读日度统计，或通过 dsh_auth.py 桥接导入网页登录态以拿逐条流水。若站点有多个镜像域名（主站/副站），全部写进 bases 数组，程序会按顺序自动故障切换。"
   }
 ]

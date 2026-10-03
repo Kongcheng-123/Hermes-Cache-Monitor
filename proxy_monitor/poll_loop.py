@@ -3,7 +3,7 @@
 
 设计依据（2026-10-01 实测 + NewAPI 源码交叉验证）：
   · NewAPI /api/log/token 无分页，固定返回最近 N 条（源码 MaxRecentItems=1000）
-  · 实测 d1api.xin 未开启 CriticalRateLimit（22 次连打无 429），但官方默认
+  · 实测 example.com 未开启 CriticalRateLimit（22 次连打无 429），但官方默认
     是 20次/20分钟/按IP —— 别的站点可能开着，所以必须保守限速
   · 窗口会滚动，一旦被写满 1000 条，更早记录永久丢失
 
@@ -17,6 +17,7 @@
 """
 import argparse
 import os
+import subprocess
 import sys
 import time
 from datetime import datetime, timedelta, timezone
@@ -64,6 +65,45 @@ def check_hermes_new_calls():
         return True
 
 
+def _alert_login_needed(reason):
+    """登录态彻底失效时兜底提醒（第 3 层）。
+
+    · 限频：12 小时内只推一条（marker 文件记时间），免得每 5 分钟刷屏
+    · 通道：若本机存在 send_weixin_text.py 就用微信推；不存在则**静默跳过**
+      （不写死依赖 → 别人 clone 这个项目也能跑，只是没提醒）
+    · 路径可用环境变量 DSH_ALERT_CMD 覆盖：命令里用 {msg} 占位
+    """
+    marker = os.path.join(HERE, ".dsh_login_alert_ts")
+    now = time.time()
+    try:
+        if os.path.isfile(marker):
+            with open(marker, "r", encoding="utf-8") as f:
+                if now - float((f.read() or "0").strip() or 0) < 12 * 3600:
+                    return
+    except Exception:
+        pass
+
+    text = ("⚠️ dshapi 逐条流水的登录态需要补一次\n"
+            "原因：%s\n"
+            "修法：cd <项目目录>\\proxy_monitor 后跑 py dsh_auth.py --login\n"
+            "（有邮箱密码可自动重登；没有就用 dsh_auth.py --import 从浏览器读一次）"
+            % reason)
+    cmd = os.environ.get("DSH_ALERT_CMD")
+    try:
+        if cmd:
+            subprocess.run(cmd.replace("{msg}", text), shell=True, timeout=40)
+        else:
+            sender = os.path.join(os.path.dirname(HERE), "send_weixin_text.py")
+            if not os.path.isfile(sender):
+                return
+            subprocess.run([sys.executable, sender, text], timeout=40)
+        with open(marker, "w", encoding="utf-8") as f:
+            f.write(str(now))
+        log("  已推送「登录态需补」提醒（12h 内不再重复）")
+    except Exception as e:
+        log("  提醒推送失败（不影响采集）：%s" % str(e)[:100])
+
+
 def one_round():
     """跑一轮采集：动态载入 site_collect，避免循环导入问题"""
     if not check_hermes_new_calls():
@@ -101,7 +141,8 @@ def one_round():
         importlib.reload(dsh_flows)
         tok = dsh_auth.ensure_token(log=lambda m: None)
         if not tok:
-            log("dsh 逐条          跳过（无登录态，跑 python dsh_auth.py --import 补）")
+            log("dsh 逐条          跳过（拿不到登录态；跑 py dsh_auth.py --login 补，或 --import 从浏览器读）")
+            _alert_login_needed("ensure_token 返回空：本地 token 已过期且续期/重登都失败")
         else:
             items, _t = dsh_flows.fetch_items(tok, pages=3, log=lambda m: None)
             if items:

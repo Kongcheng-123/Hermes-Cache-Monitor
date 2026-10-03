@@ -24,6 +24,7 @@
    因此刷新后会把新 token 反向写回浏览器，保证两边一致（sync_to_browser）。
 """
 import argparse
+import getpass
 import json
 import os
 import sys
@@ -36,9 +37,18 @@ STORE = os.path.join(HERE, "dsh_auth.json")
 # ⚠️ 主站域名故障切换（2026-10-01 实测）
 #   主站 api.dshapi.icu 曾整站 TLS 握手失败，副站 api2.dshapi.icu 正常。
 #   两者是【同一账号的不同入口】，凭据与接口完全通用 → 做成域名池，谁通用谁。
-#   顺序即优先级：首选 api2（当前在用），失败回退主站。
-BASES = ["https://api2.dshapi.icu", "https://api.dshapi.icu"]
+#   顺序即优先级：首选配置里排第一的（当前在用），失败回退下一个。
+#
+# 2026-10-04 改造：域名从 sites.json 读，代码零硬编码。
+try:
+    from . import site_resolver as _sr
+except ImportError:
+    import site_resolver as _sr
+
+_S2 = _sr.default_sub2api_site()
+BASES = _sr.bases_of(_S2) or ["https://api.example.com"]
 BASE = BASES[0]          # 兼容旧引用；实际请求走 _base()
+SITE_HOST = _sr.host_from_url(BASES[0]) or "example.com"   # 仅用于提示文字
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
 # access_token 提前续期的余量（秒）——剩不到这么多就先换
@@ -148,17 +158,78 @@ def refresh(store=None, log=print):
     return store
 
 
-def ensure_token(log=print):
-    """拿到可用 access_token；快过期就自动续；续不了返回 None"""
-    store = load()
-    if not store.get("refresh_token"):
+def login(email, password, log=print, save_password=False):
+    """用邮箱+密码登录，换一对新 token（★会新建一个独立的「会话家族」）。
+
+    ⚠️ 为什么这是稳定链路（2026-10-03 读 sub2api 源码确认，auth_service.go）：
+      · 每次 login → GenerateTokenPair(ctx, user, "") → familyID 为空 → 服务端
+        **新生成一个随机 familyID**，token 分别挂在「用户集合」和「家族集合」下；
+      · 而 refresh → RefreshTokenPair(同一 familyID) + DeleteRefreshToken(旧值)
+        → **同家族强制轮转**，谁先刷谁就把对方手里的旧票作废。
+      ⇒ 所以：
+        - **借**浏览器那张票去 refresh（共享家族）→ 必然与浏览器分叉 → 断链；
+        - 脚本**自己 login**（独立家族）→ 浏览器怎么刷都影响不到我们，反之亦然。
+      另：撤销是分级的（RevokeRefreshToken 单条 / RevokeSessionFamily 单家族 /
+      RevokeAllUserSessions 全部），所以脚本登录**不会**把浏览器踢下线。
+    """
+    st, body = _post("/api/v1/auth/login",
+                     {"email": email, "password": password})
+    try:
+        j = json.loads(body)
+    except Exception:
+        log("  ✗ 登录响应无法解析：HTTP %s %s" % (st, (body or "")[:160]))
         return None
-    if expiring(store):
-        log("  token 即将过期，自动续期…")
-        store = refresh(store, log=log)
-        if not store:
-            return None
-    return store.get("access_token")
+    if j.get("code") not in (0, None) or not j.get("data"):
+        log("  ✗ 登录失败（HTTP %s）：%s" % (st, j.get("message")))
+        return None
+    d = j["data"]
+    if d.get("requires_2fa"):
+        log("  ✗ 该账号开了两步验证（2FA），脚本没法自动登录，请改用 --import 喂凭据")
+        return None
+    store = {
+        "access_token": d.get("access_token"),
+        "refresh_token": d.get("refresh_token") or "",
+        "expires_at": int(time.time()) + int(d.get("expires_in") or 86400),
+        "account": (d.get("user") or {}).get("email") or email,
+        "email": email,
+        "source": "login",
+        "refreshed_at": int(time.time()),
+    }
+    old = load()
+    if save_password:
+        store["password"] = password
+    elif old.get("password"):
+        store["password"] = old["password"]      # 不因一次未带标志的登录把它抹掉
+    save(store)
+    log("  ✓ 登录成功（独立会话家族，expires_in=%s 秒）" % d.get("expires_in"))
+    return store
+
+
+def ensure_token(log=print):
+    """拿可用的 access_token。三级降级：
+
+      ① 本地 access_token 还没到期（留 RENEW_MARGIN 余量）→ 直接用（零动作）
+      ② 到期了 → 用 refresh_token 续（同家族轮转）
+      ③ 续不动了 → 有邮箱密码就**重新登录**（新建家族，浏览器不受影响）
+    返回 None = 彻底拿不到，调用方应提示用户补一次凭据（别静默）。
+    """
+    store = load()
+    if store.get("access_token") and not expiring(store):
+        return store["access_token"]
+
+    if store.get("refresh_token"):
+        log("  token 快过期/已过期，自动续期…")
+        new = refresh(store, log=log)
+        if new and new.get("access_token"):
+            return new["access_token"]
+
+    if store.get("email") and store.get("password"):
+        log("  续期失败，改用账号密码重新登录（会新建独立家族）…")
+        new = login(store["email"], store["password"], log=log)
+        if new and new.get("access_token"):
+            return new["access_token"]
+
+    return None
 
 
 def verify(tok):
@@ -266,6 +337,12 @@ def main():
     ap = argparse.ArgumentParser(description="dshapi 登录态管理")
     ap.add_argument("--import", dest="do_import", action="store_true",
                     help="从浏览器喂一次凭据（首次用）")
+    ap.add_argument("--login", action="store_true",
+                    help="★用邮箱+密码登录（推荐：建独立会话家族，不影响浏览器）")
+    ap.add_argument("--email", help="配合 --login：账号邮箱")
+    ap.add_argument("--password", help="配合 --login：密码（不填则交互输入，更安全）")
+    ap.add_argument("--save-password", action="store_true",
+                    help="把密码一并存进 dsh_auth.json（换来「换 IP / 家族被撤」后能自愈）")
     ap.add_argument("--refresh", action="store_true", help="手动续期")
     ap.add_argument("--status", action="store_true", help="看当前状态")
     ap.add_argument("--sync", action="store_true", help="把 token 写回浏览器")
@@ -274,6 +351,31 @@ def main():
 
     if a.do_import:
         import_from_browser()
+        return
+    if a.login:
+        email = (a.email or "").strip()
+        if not email:
+            try:
+                email = input("dshapi 账号邮箱: ").strip()
+            except EOFError:
+                print("✗ 没拿到邮箱")
+                return
+        pwd = a.password
+        if not pwd:
+            try:
+                pwd = getpass.getpass("密码（不回显）: ")
+            except EOFError:
+                print("✗ 没拿到密码")
+                return
+        if not email or not pwd:
+            print("✗ 邮箱/密码不能为空")
+            return
+        st = login(email, pwd, save_password=a.save_password)
+        if st:
+            print("  ✓ token 可用" if verify(st["access_token"]) else "  ⚠ 拿到了 token 但校验失败")
+            if not a.save_password:
+                print("  提示：未存密码（默认）。想让「换 IP / 家族被撤」后也能自愈，"
+                      "加 --save-password 重跑一次。")
         return
     if a.refresh:
         refresh()
@@ -303,6 +405,11 @@ def main():
     print("  上次续期     : %s" % (
         time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(st.get("refreshed_at") or 0))))
     print("  可自动续期   : %s" % ("是" if st.get("refresh_token") else "否"))
+    print("  可自动重登   : %s" % ("是（已存邮箱+密码）" if (st.get("email") and st.get("password"))
+                                  else "否 —— 想更稳可跑 --login --save-password"))
+    print("  凭据来源     : %s" % (st.get("source") or "?"))
+    if st.get("email"):
+        print("  账号         : %s" % st["email"])
 
 
 if __name__ == "__main__":

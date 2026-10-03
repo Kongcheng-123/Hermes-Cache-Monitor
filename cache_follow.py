@@ -11,15 +11,15 @@ v4 新增：
 - 缺账明细弹窗、价格填写弹窗、价格表管理窗口
 
 用法:
-  python "D:\\Hermes works\\cache_follow.py"         # 悬浮窗模式
-  python "D:\\Hermes works\\cache_follow.py" --once  # 打印一次当前结果（调试）
-  python "D:\\Hermes works\\cache_follow.py" --sid <会话ID>        # 指定会话
-  python "D:\\Hermes works\\cache_follow.py" --stats all           # 文本打印成本统计（24h/today/7d/30d/all）
-  python "D:\\Hermes works\\cache_follow.py" --segments            # 打印价格表的价格段（时间轴）
-  python "D:\\Hermes works\\cache_follow.py" --recompute day       # 按「当天生效的价格段」逐日重算（day/missing/all）
-  python "D:\\Hermes works\\cache_follow.py" --bill-file bills.json  # 导入实付锚点（单对象或数组）
-  python "D:\\Hermes works\\cache_follow.py" --bills --resolve     # 列出锚点并反推倍率/真单价
-  python "D:\\Hermes works\\cache_follow.py" --bill-del "host|model|from|to"
+  python "<项目目录>\\cache_follow.py"         # 悬浮窗模式
+  python "<项目目录>\\cache_follow.py" --once  # 打印一次当前结果（调试）
+  python "<项目目录>\\cache_follow.py" --sid <会话ID>        # 指定会话
+  python "<项目目录>\\cache_follow.py" --stats all           # 文本打印成本统计（24h/today/7d/30d/all）
+  python "<项目目录>\\cache_follow.py" --segments            # 打印价格表的价格段（时间轴）
+  python "<项目目录>\\cache_follow.py" --recompute day       # 按「当天生效的价格段」逐日重算（day/missing/all）
+  python "<项目目录>\\cache_follow.py" --bill-file bills.json  # 导入实付锚点（单对象或数组）
+  python "<项目目录>\\cache_follow.py" --bills --resolve     # 列出锚点并反推倍率/真单价
+  python "<项目目录>\\cache_follow.py" --bill-del "host|model|from|to"
 """
 import collections
 import json
@@ -32,7 +32,7 @@ import tempfile
 import threading
 import time
 import tkinter as tk
-from datetime import datetime
+from datetime import datetime, timedelta
 from tkinter import filedialog, messagebox, ttk
 from urllib.parse import quote, urlparse
 
@@ -107,6 +107,7 @@ def apply_dark_title_bar(win, bg_hex="#1e1e24"):
 
 
 APP_NAME = "HermesCacheMonitor"
+APP_VERSION = "1.1.0"
 
 # 数据目录分裂检测结果（由 _appdata_dir() 填充）：非空 = 发现 MSIX 虚拟化影子目录
 _DATA_SPLIT = ""
@@ -385,8 +386,8 @@ def init_paths(cfg=None):
     CALIB_PATH = os.path.join(dd, "proxy_calibration.json")
     SITE_MERGE_PATH = os.path.join(dd, "site_merge.json")
 
-    # 老版本把数据放在 D:\Hermes works → 平滑迁移一次
-    legacy = r"D:\Hermes works"
+    # 老版本把数据放在 <项目目录> → 平滑迁移一次
+    legacy = r"<项目目录>"
     if os.path.isdir(legacy) and os.path.abspath(legacy) != os.path.abspath(dd):
         for name in ("cache_prices.json", "cost_ledger.json", "calib_samples.json"):
             src = os.path.join(legacy, name)
@@ -471,11 +472,8 @@ CHAR_PER_TOK_OTHER = 0.2343
 
 # 现代极简暗黑配色系统（Zinc 暗调风格，柔和耐看）
 BG = "#16161a"          # 深度碳黑背景
-BG_CARD = "#222228"     # 胶囊与卡片衬底
-BORDER = "#32323a"      # 1px 微边框
 FG = "#f4f4f6"          # 主高亮文字
 DIM = "#94949e"         # 辅助浅灰
-MUTED = "#63636e"       # 弱化次灰
 GREEN = "#4ade80"       # 现代柔和荧光翠绿（不刺眼）
 YELLOW = "#fbbf24"      # 浅暖琥珀金
 RED = "#f87171"         # 柔和浅珊瑚红
@@ -487,7 +485,6 @@ FONT_S = ("Microsoft YaHei UI", 8)
 FONT_L = ("Cascadia Code", 22, "bold")       # 大命中率：等宽精密仪表质感
 FONT_CODE = ("Cascadia Code", 9)            # 关键数字、Token与价格行
 FONT_CODE_S = ("Cascadia Code", 8)          # 紧凑等宽小数字
-FONT_CODE_B = ("Cascadia Code", 10, "bold") # 粗体等宽数字
 
 
 # ─────────────────── 思考档位（reasoning effort，可移植） ───────────────────
@@ -973,14 +970,8 @@ def is_peak(now_hm, segments, day=None, weekend_off=False):
     return False
 
 
-# ---------- 站点域名归一 (site_merge) ----------
-DEFAULT_SITE_MERGE = {
-    "api.dshapi.icu": "api.dshapi.icu",
-    "api2.dshapi.icu": "api.dshapi.icu",
-    "api3.dshapi.icu": "api.dshapi.icu",
-    "api4.dshapi.icu": "api.dshapi.icu",
-}
-_SITE_MERGE_CACHE = None
+DEFAULT_MODEL_MERGE = {}
+_SITE_MERGE_CACHE = None    # 归并配置缓存（站点表 + 模型表一起）
 _SITE_MERGE_MTIME = 0.0
 
 
@@ -997,54 +988,748 @@ def _get_proxy_monitor_dir():
     appdata = os.environ.get("APPDATA")
     if appdata:
         cands.append(os.path.join(appdata, "HermesCacheMonitor", "proxy_monitor"))
-    cands.append(r"D:\Hermes works\proxy_monitor")
+    cands.append(r"<项目目录>\proxy_monitor")
     for p in cands:
         if p and os.path.isdir(p):
             return p
     return cands[0]
 
 
-def load_site_merge():
-    global _SITE_MERGE_CACHE, _SITE_MERGE_MTIME
-    cands = []
-    if "SITE_MERGE_PATH" in globals() and SITE_MERGE_PATH:
-        cands.append(SITE_MERGE_PATH)
-    cands.append(os.path.join(os.environ.get("APPDATA") or "", "HermesCacheMonitor", "site_merge.json"))
-    pm_dir = _get_proxy_monitor_dir()
-    cands.append(os.path.join(pm_dir, "host_alias.json"))
+def _host_of(url):
+    """从 URL / base_url 里抠出纯域名（小写、去端口与路径）。"""
+    s = str(url or "").strip().lower()
+    if not s:
+        return ""
+    if "://" in s:
+        s = s.split("://", 1)[1]
+    s = s.split("/", 1)[0].split("?", 1)[0].split("@")[-1]
+    return s.split(":")[0].strip()
 
-    cand = next((p for p in cands if p and os.path.isfile(p)), None)
-    if not cand:
-        if _SITE_MERGE_CACHE is None:
-            _SITE_MERGE_CACHE = dict(DEFAULT_SITE_MERGE)
-        return _SITE_MERGE_CACHE
+
+def _sites_json_path():
+    return os.path.join(_get_proxy_monitor_dir(), "sites.json")
+
+
+# 常见的两段式后缀（用于取「可注册主域名」）
+_TWO_PART_SUFFIX = ("com.cn", "net.cn", "org.cn", "gov.cn", "edu.cn", "com.hk",
+                    "com.tw", "co.uk", "co.jp", "co.kr", "com.au", "ne.jp",
+                    "com.sg", "com.br", "com.ru", "org.uk")
+
+
+def _base_domain(host):
+    """取可注册主域名：apivip.dshapi.icu -> dshapi.icu。
+
+    只用来「认出同一家的新入口」，不做任何改写；拿不准就返回空串。
+    """
+    h = str(host or "").strip().lower().strip(".")
+    if not h or h in ("?", "localhost") or ":" in h or "/" in h:
+        return ""
+    if re.match(r"^[\d.]+$", h):          # 裸 IP 不参与
+        return ""
+    parts = [p for p in h.split(".") if p]
+    if len(parts) < 2:
+        return ""
+    last2 = ".".join(parts[-2:])
+    if last2 in _TWO_PART_SUFFIX and len(parts) >= 3:
+        return ".".join(parts[-3:])
+    return last2
+
+
+def _db_hosts_models():
+    """Hermes 库里现用的 (原始主机, 原始模型)。**不做 canon**（避免递归）。"""
+    out = []
     try:
-        m = os.path.getmtime(cand)
-        if _SITE_MERGE_CACHE is not None and m == _SITE_MERGE_MTIME:
-            return _SITE_MERGE_CACHE
+        for host, model in db_query(
+                "SELECT DISTINCT billing_base_url, model FROM session_model_usage"):
+            h = ""
+            try:
+                h = urlparse(host or "").hostname or (host or "")
+            except Exception:
+                h = host or ""
+            out.append((str(h).strip().lower(), str(model or "").strip()))
+    except Exception:
+        pass
+    return out
+
+
+def _known_ledger_names():
+    """账本里出现过的 (站点集合, 模型集合)。"""
+    hosts, models = set(), set()
+    p = LEDGER_PATH if "LEDGER_PATH" in globals() else ""
+    if not p or not os.path.isfile(p):
+        return hosts, models
+    try:
+        with open(p, "r", encoding="utf-8-sig") as f:
+            d = json.load(f)
+        for blob in (d.get("days") or {}).values():
+            for k in (blob or {}):
+                parts = str(k).split("|", 1)
+                if parts[0].strip():
+                    hosts.add(parts[0].strip())
+                if len(parts) == 2 and parts[1].strip():
+                    models.add(parts[1].strip())
+    except Exception:
+        pass
+    return hosts, models
+
+
+def _auto_site_merge():
+    """从站点监控自动派生站点归并表 —— 「对齐站点」靠的就是这一步。
+
+    两条规则：
+      ① 域名池：读 proxy_monitor/sites.json，把每个站的 `bases` / `base_url` 域名
+         并入该站的 `host`（`host` 是库内站点身份，历史流水都挂它名下）。
+      ② ★同主域名：新域名（如 apivip.dshapi.icu）只要和站点监控里某个站
+         共享同一个主域名（dshapi.icu），就自动并入那个站 —— 这样「新加的入口」
+         不用手填也能被认出来。同一主域名下挂多个站时**不动**（不敢猜）。
+
+    返回 {别名域名: 主站名}
+    """
+    out = {}
+    p = _sites_json_path()
+    if not os.path.isfile(p):
+        return out
+    try:
+        with open(p, "r", encoding="utf-8-sig") as f:
+            d = json.load(f)
+    except Exception:
+        return out
+
+    sites_hosts = set()
+    for s in (d.get("sites") or []):
+        if not isinstance(s, dict):
+            continue
+        target = _host_of(s.get("host"))
+        if not target:
+            continue
+        sites_hosts.add(target)
+        # ① 域名池
+        cands = [_host_of(s.get("host")), _host_of(s.get("base_url"))]
+        cands += [_host_of(b) for b in (s.get("bases") or [])]
+        for c in cands:
+            if c and c != target:
+                out[c] = target
+
+    # ② 同主域名自动识别新入口
+    bd2host = {}
+    for t in sites_hosts:
+        bd = _base_domain(t)
+        if bd:
+            bd2host.setdefault(bd, set()).add(t)
+    if bd2host:
+        seen = set(sites_hosts)
+        lh, _lm = _known_ledger_names()
+        seen |= lh
+        seen |= {h for h, _m in _db_hosts_models()}
+        for h in sorted(seen):
+            if not h or h == "?" or h in out or h in sites_hosts:
+                continue
+            cands = bd2host.get(_base_domain(h)) or set()
+            if len(cands) == 1:
+                t = next(iter(cands))
+                if t != h:
+                    out[h] = t
+    return out
+
+
+def _file_mtime(p):
+    try:
+        return round(os.path.getmtime(p), 6) if (p and os.path.isfile(p)) else 0.0
+    except OSError:
+        return 0.0
+
+
+def _site_monitor_aliases():
+    """站点归一的**唯一权威源**：读站点监控侧的 `host_alias.py`。
+
+    ⚠️ 为什么改成这样（2026-10-03 清理）：
+      这里原本内置一份 `DEFAULT_SITE_MERGE`（api/api2/api3/api4 → api.dshapi.icu），
+      而站点监控侧 `proxy_monitor/host_alias.py` 里有一份**一模一样的** `DEFAULT_ALIAS`。
+      同一件事两处各写一份 → 以后改一家站的域名归并，只改一边就会对不上账。
+      现在统一从站点监控侧读，那边改一处、两边同时生效。
+
+    读不到（文件缺失/语法错）→ 返回空表，其余规则（自动识别 + 手写配置）照常生效。
+    """
+    out = {}
+    p = os.path.join(_get_proxy_monitor_dir(), "host_alias.py")
+    if not os.path.isfile(p):
+        return out
+    try:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("_pm_host_alias", p)
+        m = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(m)
+        d = getattr(m, "DEFAULT_ALIAS", None)
+        if isinstance(d, dict):
+            for k, v in d.items():
+                if isinstance(k, str) and isinstance(v, str) and k.strip() and v.strip():
+                    out[k.strip().lower()] = v.strip().lower()
+    except Exception:
+        return {}
+    return out
+
+
+def _merge_sig():
+    """归并配置的缓存签名：归并文件 / sites.json / store.db / 账本 / Hermes 库
+    任一变动就重建（新站一冒头就自动认出来，不用手点刷新）。"""
+    p = SITE_MERGE_PATH if "SITE_MERGE_PATH" in globals() else ""
+    lp = LEDGER_PATH if "LEDGER_PATH" in globals() else ""
+    hp = DB if "DB" in globals() else ""
+    return (_file_mtime(p), _file_mtime(_sites_json_path()),
+            _file_mtime(os.path.join(_get_proxy_monitor_dir(), "store.db")),
+            _file_mtime(lp), _file_mtime(hp))
+
+
+def _known_ledger_models():
+    """账本里出现过的模型名（自动归并的候选来源）。"""
+    return _known_ledger_names()[1]
+
+
+def _site_monitor_models():
+    """站点监控库里用过的模型名 —— 这些就是「标准名」，模型归并拿它们对齐。"""
+    out = set()
+    p = os.path.join(_get_proxy_monitor_dir(), "store.db")
+    if not os.path.isfile(p):
+        return out
+    try:
+        con = sqlite3.connect("file:%s?mode=ro" % p.replace("\\", "/"), uri=True)
+        for (m,) in con.execute("SELECT DISTINCT model FROM usage_flows"):
+            m = str(m or "").strip()
+            if m and m != "*":
+                out.add(m)
+        con.close()
+    except Exception:
+        pass
+    return out
+
+
+# ⚠️ 站点监控库的**唯一权威过滤口径**，必须与 proxy_monitor/panel.py 的 NON_FLOW
+#    保持一致（区别只是表别名用 u. 前缀，便于在 JOIN 查询里引用）。
+#    sub2api(dshapi) 站同一笔用量会留下 client: 逐条流水 + sub2api-daily/model: 汇总行，
+#    token 与金额互相重叠，全表 SUM 会重复计费。策略：有逐条就只认逐条。
+_FLOW_NON_DUP = (
+    "(request_id NOT LIKE 'sub2api-model:%' "
+    " AND (request_id NOT LIKE 'sub2api-daily:%' "
+    "      OR NOT EXISTS (SELECT 1 FROM usage_flows x "
+    "                     WHERE x.site = usage_flows.site "
+    "                       AND x.request_id LIKE 'client:%' "
+    "                       AND x.day = usage_flows.day)))")
+
+_FLOW_NON_DUP_U = (
+    "(u.request_id NOT LIKE 'sub2api-model:%' "
+    " AND (u.request_id NOT LIKE 'sub2api-daily:%' "
+    "      OR NOT EXISTS (SELECT 1 FROM usage_flows x "
+    "                     WHERE x.site = u.site "
+    "                       AND x.request_id LIKE 'client:%' "
+    "                       AND x.day = u.day)))")
+
+_SITE_TRUTH_CACHE = {}
+
+
+def site_truth_agg(since_ts=None, until_ts=None):
+    """站方真值：从站点监控库读「站方实际收的钱」，按 站×模型 聚合。
+
+    为什么以它为准：站方是收钱的一方，它的数字就是实付。Hermes 侧靠
+    session_model_usage 的水位差估算，会因上游不回缓存明细等原因偏离。
+
+    返回 {"host|model": {"calls","in","hit","out","cost"}}；读不到返回 {}。
+    """
+    p = os.path.join(_get_proxy_monitor_dir(), "store.db")
+    if not os.path.isfile(p):
+        return {}
+    sig = (round(since_ts, 3) if since_ts else None,
+           round(until_ts, 3) if until_ts else None, _file_mtime(p))
+    hit = _SITE_TRUTH_CACHE.get(sig)
+    if hit is not None:
+        return hit
+    out = {}
+    try:
+        con = sqlite3.connect("file:%s?mode=ro" % p.replace("\\", "/"), uri=True)
+        sql = ("SELECT site, model, COUNT(*), SUM(in_tokens), SUM(cache_read), "
+               "SUM(out_tokens), SUM(cost), "
+               "SUM(CASE WHEN cost IS NULL THEN 1 ELSE 0 END) FROM usage_flows "
+               "WHERE day != '' AND %s" % _FLOW_NON_DUP)
+        args = []
+        if since_ts:
+            sql += " AND ts >= ?"
+            args.append(int(since_ts))
+        if until_ts:
+            sql += " AND ts <= ?"
+            args.append(int(until_ts))
+        sql += " GROUP BY site, model"
+        for s, m, n, i, cr, o, c, miss in con.execute(sql, args):
+            h = canon_host(str(s or "").strip())
+            mm = canon_model(str(m or "").strip() or "*")
+            k = "%s|%s" % (h, mm)
+            a = out.setdefault(k, {"calls": 0, "in": 0, "hit": 0, "out": 0,
+                                   "cost": 0.0, "cost_missing": 0})
+            a["calls"] += n or 0
+            a["in"] += i or 0
+            a["hit"] += cr or 0
+            a["out"] += o or 0
+            a["cost"] += float(c or 0)
+            a["cost_missing"] += miss or 0
+        con.close()
+    except Exception:
+        return {}
+    if len(_SITE_TRUTH_CACHE) > 32:
+        _SITE_TRUTH_CACHE.clear()
+    _SITE_TRUTH_CACHE[sig] = out
+    return out
+
+
+_SITE_TRUTH_DAY_CACHE = {}
+
+
+def _day_in_scope(d, day_set):
+    """这一天该不该参与「站方真值」替换（防未来日期 / 脏日期污染）。
+
+    ⚠️ 为什么必须有（2026-10-03 自查实测）：
+      站点监控库的 day 直接取站方返回的 created_at 日期。一旦站方后台时区偏移、
+      或出现按日汇总之类的脏行，day 就可能落到「明天」甚至更远。
+      `day_set` 只由窗口内**过去的天**构成，所以未来日期天然不在集合里；
+      但 `all` / 不限窗口时 day_set 是 None —— 那种写法会把未来日期也算进总额。
+      这里统一收口：必须是合法 YYYY-MM-DD、且不晚于今天，才允许参与替换。
+
+    实测（合成未来日期 ¥77 的行）：修前 7d 合计被推到 ¥101.02，修后回到正常值。
+    """
+    if not d:
+        return False
+    try:
+        dd = datetime.strptime(str(d), "%Y-%m-%d").date()
+    except (ValueError, TypeError):
+        return False
+    if dd > datetime.now().date():
+        return False
+    if day_set is not None and str(d) not in day_set:
+        return False
+    return True
+
+
+def site_truth_days():
+    """按天读站方真值：{day: {"host|model": {calls,in,hit,out,cost}}}。
+
+    ⚠️ 覆盖替换必须**按天**做：站方库只保留 7 天，账本有几十天 —— 按整个窗口
+       替换会把站方没覆盖到的天一起抹掉（会少算）。
+    口径与 site_truth_agg 完全一致（NON_FLOW 去重）。
+    """
+    p = os.path.join(_get_proxy_monitor_dir(), "store.db")
+    if not os.path.isfile(p):
+        return {}
+    sig = _file_mtime(p)
+    hit = _SITE_TRUTH_DAY_CACHE.get(sig)
+    if hit is not None:
+        return hit
+    out = {}
+    try:
+        con = sqlite3.connect("file:%s?mode=ro" % p.replace("\\", "/"), uri=True)
+        for s, m, d, n, i, cr, o, c, miss in con.execute(
+                "SELECT site, model, day, COUNT(*), SUM(in_tokens), SUM(cache_read), "
+                "SUM(out_tokens), SUM(cost), "
+                "SUM(CASE WHEN cost IS NULL THEN 1 ELSE 0 END) FROM usage_flows "
+                "WHERE day != '' AND %s GROUP BY site, model, day" % _FLOW_NON_DUP):
+            h = canon_host(str(s or "").strip())
+            mm = canon_model(str(m or "").strip() or "*")
+            day = str(d or "").strip()
+            if not day:
+                continue
+            a = out.setdefault(day, {}).setdefault(
+                "%s|%s" % (h, mm),
+                {"calls": 0, "in": 0, "hit": 0, "out": 0, "cost": 0.0, "cost_missing": 0})
+            a["calls"] += n or 0
+            a["in"] += i or 0
+            a["hit"] += cr or 0
+            a["out"] += o or 0
+            a["cost"] += float(c or 0)
+            a["cost_missing"] += miss or 0
+        con.close()
+    except Exception:
+        return {}
+    if len(_SITE_TRUTH_DAY_CACHE) > 8:
+        _SITE_TRUTH_DAY_CACHE.clear()
+    _SITE_TRUTH_DAY_CACHE[sig] = out
+    return out
+
+
+def site_truth_session(sid):
+    """实时查库：某个会话归集到的全部站方流水（站方实付口径）。
+
+    ⚠️ 为什么要它（2026-10-03 实测）：
+      原来悬浮窗读 `proxy_calibration.json` 那份**快照**。但 `flow_sessions`
+      的归集（时间戳最近邻匹配）**每轮采集都会重跑**，同一个 request_id 可能被
+      改判给别的会话 —— 于是快照一旦作废，数字就和站点监控面板永久对不上。
+      实测同一时刻：库/面板 664 条 ¥1.465409，而校准文件仍是 676 条 ¥1.482325
+      （那 12 条在库里根本不存在，是上一轮归集的残留）。
+
+      改成直接查库、用与 panel.py **完全相同的口径**，两边就永远是同一次查询
+      的结果，不存在"快照过期"。
+
+    返回 {"cost","calls","in","cache","out","sites","last_ts"}；查不到返回 None。
+    """
+    p = os.path.join(_get_proxy_monitor_dir(), "store.db")
+    if not os.path.isfile(p) or not sid:
+        return None
+    try:
+        con = sqlite3.connect("file:%s?mode=ro" % p.replace("\\", "/"), uri=True)
+        con.row_factory = sqlite3.Row
+        # ⚠️ 过滤条件必须与 proxy_monitor/panel.py 的 NON_FLOW 一致
+        rows = list(con.execute("""
+            SELECT u.site, COUNT(*) n, SUM(u.cost) c, SUM(u.in_tokens) i,
+                   SUM(u.cache_read) cr, SUM(u.out_tokens) o, MAX(u.ts) lt
+            FROM flow_sessions f JOIN usage_flows u
+              ON u.site = f.site AND u.request_id = f.request_id
+            WHERE f.session_id = ? AND %s
+            GROUP BY u.site""" % _FLOW_NON_DUP_U, (sid,)))
+        con.close()
+    except Exception:
+        return None
+    if not rows:
+        return None
+    out = {"cost": 0.0, "calls": 0, "in": 0, "cache": 0, "out": 0,
+           "sites": [], "last_ts": 0}
+    for r in rows:
+        out["cost"] += float(r["c"] or 0)
+        out["calls"] += int(r["n"] or 0)
+        out["in"] += int(r["i"] or 0)
+        out["cache"] += int(r["cr"] or 0)
+        out["out"] += int(r["o"] or 0)
+        if r["site"]:
+            out["sites"].append(canon_host(r["site"]))
+        out["last_ts"] = max(out["last_ts"], int(r["lt"] or 0))
+    return out
+
+
+def site_truth_daily(day=None, host=None):
+    """实时查库：某天（默认今天）各站的站方实付。供悬浮窗站点行显示。"""
+    p = os.path.join(_get_proxy_monitor_dir(), "store.db")
+    if not os.path.isfile(p):
+        return {}
+    if not day:
+        day = datetime.now().strftime("%Y-%m-%d")
+    out = {}
+    try:
+        con = sqlite3.connect("file:%s?mode=ro" % p.replace("\\", "/"), uri=True)
+        for s, n, c in con.execute(
+                "SELECT site, COUNT(*), SUM(cost) FROM usage_flows "
+                "WHERE day = ? AND day != '' AND %s GROUP BY site"
+                % _FLOW_NON_DUP, (day,)):
+            k = canon_host(str(s or ""))
+            a = out.setdefault(k, {"calls": 0, "cost": 0.0})
+            a["calls"] += int(n or 0)
+            a["cost"] += float(c or 0)
+        con.close()
+    except Exception:
+        return {}
+    if host:
+        return out.get(canon_host(host))
+    return out
+
+
+def _model_candidates(m):
+    """一个模型名的候选取法：剥开头的 [频道tag]；剥 provider/ 前缀。"""
+    out = []
+    s = re.sub(r"^\[[^\]]*\]\s*", "", m)
+    if s and s != m:
+        out.append(s)
+    if "/" in m:
+        tail = m.split("/", 1)[1]
+        if tail:
+            out.append(tail)
+        t2 = re.sub(r"^\[[^\]]*\]\s*", "", tail)
+        if t2 and t2 != tail:
+            out.append(t2)
+    return out
+
+
+def _auto_model_merge():
+    """自动模型名归并（保守）：只当「剥前缀后的名字」确实是**已知标准名**时才合并。
+
+    已知标准名 = 站点监控库用过的模型名 ∪ 账本里已在用的名字。
+    → `deepseek/deepseek-v4.1-flash`、`[a]gemini-3.8-flash` 会自动归并；
+      而 `stealth/ox-alpha`（剥出来的 ox-alpha 谁都没用过）原地不动。
+    """
+    ledger_models = _known_ledger_models()
+    known = _site_monitor_models() | ledger_models
+    out = {}
+    for m in ledger_models:
+        for c in _model_candidates(m):
+            if c in known and c != m:
+                out[m] = c
+                break
+    return out
+
+
+def load_name_merge(force=False):
+    """读归并配置（站点 + 模型），带签名缓存。
+
+    返回 {"sites": {别名:主站}, "models": {别名:标准模型名},
+          "auto_align": bool, "auto_model": bool}
+    优先级：手动配置 > 自动规则 > 代码里的默认表。
+    """
+    global _SITE_MERGE_CACHE, _SITE_MERGE_MTIME
+    sig = _merge_sig()
+    if not force and _SITE_MERGE_CACHE is not None and sig == _SITE_MERGE_MTIME:
+        return _SITE_MERGE_CACHE
+
+    path = SITE_MERGE_PATH if "SITE_MERGE_PATH" in globals() else ""
+    cands = [path,
+             os.path.join(os.environ.get("APPDATA") or "", "HermesCacheMonitor", "site_merge.json"),
+             os.path.join(_get_proxy_monitor_dir(), "host_alias.json")]
+    cand = next((p for p in cands if p and os.path.isfile(p)), None)
+
+    man_sites, man_models = {}, {}
+    auto_align, auto_model = True, True
+    if cand:
+        try:
+            with open(cand, "r", encoding="utf-8-sig") as f:
+                d = json.load(f)
+            if isinstance(d, dict):
+                if "auto_align" in d:
+                    auto_align = bool(d.get("auto_align"))
+                if "auto_model" in d:
+                    auto_model = bool(d.get("auto_model"))
+                for k, v in (d.get("map") or {}).items():
+                    if isinstance(k, str) and isinstance(v, str) and k.strip() and v.strip():
+                        man_sites[k.strip().lower()] = v.strip().lower()
+                for k, v in (d.get("models") or {}).items():
+                    if isinstance(k, str) and isinstance(v, str) and k.strip() and v.strip():
+                        man_models[k.strip().lower()] = v.strip().lower()
+                if "map" not in d and "models" not in d:
+                    # 兼容最老的格式：整个文件就是站点映射表
+                    for k, v in d.items():
+                        if (isinstance(k, str) and isinstance(v, str)
+                                and not k.startswith("_")
+                                and k not in ("auto_align", "auto_model")):
+                            man_sites[k.strip().lower()] = v.strip().lower()
+        except Exception:
+            pass
+
+    sites = dict(_site_monitor_aliases())    # ★ 归一规则统一由站点监控侧提供
+    if auto_align:
+        sites.update(_auto_site_merge())
+    sites.update(man_sites)
+    models = dict(DEFAULT_MODEL_MERGE)
+    if auto_model:
+        models.update(_auto_model_merge())
+    models.update(man_models)
+
+    _SITE_MERGE_CACHE = {"sites": sites, "models": models,
+                         "auto_align": auto_align, "auto_model": auto_model}
+    _SITE_MERGE_MTIME = sig
+    return _SITE_MERGE_CACHE
+
+
+def load_site_merge():
+    return load_name_merge()["sites"]
+
+
+def load_model_merge():
+    return load_name_merge()["models"]
+
+
+def load_name_merge_raw():
+    """只读配置文件里的**手动**规则（不含自动派生），给设置界面显示用。"""
+    path = SITE_MERGE_PATH if "SITE_MERGE_PATH" in globals() else ""
+    cands = [path,
+             os.path.join(os.environ.get("APPDATA") or "", "HermesCacheMonitor", "site_merge.json")]
+    cand = next((p for p in cands if p and os.path.isfile(p)), None)
+    out = {"sites": {}, "models": {}, "auto_align": True, "auto_model": True}
+    if not cand:
+        return out
+    try:
         with open(cand, "r", encoding="utf-8-sig") as f:
             d = json.load(f)
-        mapping = d.get("map", d) if isinstance(d, dict) else {}
-        merged = dict(DEFAULT_SITE_MERGE)
-        for k, v in mapping.items():
-            if isinstance(k, str) and isinstance(v, str):
-                merged[k.strip().lower()] = v.strip().lower()
-        _SITE_MERGE_CACHE = merged
-        _SITE_MERGE_MTIME = m
-        return _SITE_MERGE_CACHE
+        if isinstance(d, dict):
+            out["auto_align"] = bool(d.get("auto_align", True))
+            out["auto_model"] = bool(d.get("auto_model", True))
+            for k, v in (d.get("map") or {}).items():
+                if isinstance(k, str) and isinstance(v, str) and k.strip() and v.strip():
+                    out["sites"][k.strip().lower()] = v.strip().lower()
+            for k, v in (d.get("models") or {}).items():
+                if isinstance(k, str) and isinstance(v, str) and k.strip() and v.strip():
+                    out["models"][k.strip().lower()] = v.strip().lower()
     except Exception:
-        if _SITE_MERGE_CACHE is None:
-            _SITE_MERGE_CACHE = dict(DEFAULT_SITE_MERGE)
-        return _SITE_MERGE_CACHE
+        pass
+    return out
+
+
+def save_name_merge(sites=None, models=None, auto_align=True, auto_model=True):
+    """把归并配置（站点表 + 模型表）写回 site_merge.json（原子写）。返回路径。"""
+    global _SITE_MERGE_CACHE, _SITE_MERGE_MTIME
+    path = SITE_MERGE_PATH if "SITE_MERGE_PATH" in globals() else ""
+    if not path:
+        path = os.path.join(os.environ.get("APPDATA") or "",
+                            "HermesCacheMonitor", "site_merge.json")
+    obj = {
+        "_note": "把同一家的多个名字合并成一个；账本、价格、显示都用合并后的名字。",
+        "_site_note": "map = 实际请求域名 → 主站名。auto_align=true 时自动读 proxy_monitor/sites.json 的域名池(bases)并入该站 host（= 对齐站点监控）；手动项优先级更高。",
+        "_model_note": "models = 模型别名 → 标准模型名。auto_model=true 时自动剥开头的 [频道tag] 与 provider/ 前缀（仅当剥出的名字是站点监控用过的已知名）。",
+        "auto_align": bool(auto_align),
+        "auto_model": bool(auto_model),
+        "map": {str(k).strip().lower(): str(v).strip().lower()
+                for k, v in (sites or {}).items() if str(k).strip() and str(v).strip()},
+        "models": {str(k).strip().lower(): str(v).strip().lower()
+                   for k, v in (models or {}).items() if str(k).strip() and str(v).strip()},
+    }
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+    _SITE_MERGE_CACHE = None
+    _SITE_MERGE_MTIME = 0.0
+    return path
+
+
+def _chase(mapping, name, limit=10):
+    """顺着归并表一路查到终点（防 a→b→c 这种链、防环）。"""
+    cur = name
+    seen = {cur.lower()}
+    for _ in range(limit):
+        nx = mapping.get(cur.lower())
+        if not nx or nx.lower() in seen:
+            break
+        seen.add(nx.lower())
+        cur = nx
+    return cur
 
 
 def canon_host(h):
     """站点域名归一（例如 api4.dshapi.icu -> api.dshapi.icu）。"""
     if not h or not isinstance(h, str):
         return h or "?"
-    h = h.strip()
-    mapping = load_site_merge()
-    return mapping.get(h.lower(), h)
+    return _chase(load_site_merge(), h.strip())
+
+
+def canon_model(m):
+    """模型名归一（例如 deepseek/deepseek-v4.1-flash -> deepseek-v4.1-flash）。
+
+    为什么要它：同一家中转站（或不同站）常把同一个模型写成不同名字
+    —— 带 provider 前缀（`deepseek/xxx`）、带频道标签（`[a]xxx`）。
+    不归一的话，账本会把同一个模型拆成好几行，价格匹配也可能落空。
+    规则来源：手动配置 + 自动剥前缀（仅当剥出的名字是已知标准名）。
+    """
+    if not m or not isinstance(m, str):
+        return m or "?"
+    m = m.strip()
+    if not m:
+        return "?"
+    return _chase(load_model_merge(), m)
+
+
+def _norm_watermark_keys(keys):
+    """把历史水位键按 canon_host 归一，并把折到同一键的别名**合并求和**。
+
+    ⚠️ 为什么必须有这个（2026-10-03 实测踩坑，一次幽灵账）：
+      水位键形如 "host|model"，而 `_watermark()` 里做过域名归一
+      （api4.dshapi.icu → api.dshapi.icu）。若「新增归一名」这条规则是在运行
+      中途才生效的，旧水位里就会残留未归一的键，于是结算时：
+        · cur（新水位）只有归一后的键，且它的值已经**含**了别名那部分
+        · prev.get(新键) 拿不到别名部分 → 差值 = 整批累计
+        → 同一批用量被当成「一天的新增量」又记一遍。
+      实测：api4 的 218 次调用 / 2.78M 输入 / 13.9M 缓存，在归一后于
+      10-01、10-02 两天各入账一次（¥0.297 + ¥0.342 的幽灵账）。
+
+      读 prev 时一并归一（别名合并求和）→ 差值归零，重复消失；
+      对将来**任何**换过域名的站都免疫。
+    """
+    out = {}
+    for k, v in (keys or {}).items():
+        if not isinstance(v, dict):
+            continue
+        h, sep, m = str(k).partition("|")
+        nk = ("%s|%s" % (canon_host(h), canon_model(m))) if sep else canon_host(h)
+        t = out.setdefault(nk, {"calls": 0, "in": 0, "hit": 0, "out": 0})
+        for f in ("calls", "in", "hit", "out"):
+            try:
+                t[f] += int(v.get(f) or 0)
+            except (TypeError, ValueError):
+                pass
+    return out
+
+
+# 「缓存明细缺失」修正的缓存（key=(会话, 调用数, 缺明细序号, 站方库签名)）——避免每秒重算
+_CACHE_FIX_CACHE = {}
+# 逐条流水配对的时间容差（秒）。两边时间戳有 20~30 秒系统偏移，留足余量即可。
+_CACHE_FIX_TOL_S = 300
+
+
+def _cache_detail_fix(sid, calls):
+    """把「没拿到缓存明细」的调用，用中转站的逐条流水补回真实缓存量。
+
+    为什么需要（2026-10-03 定位并实测）：
+      · Hermes 的 agent.log **只在缓存非零时**才打印 `cache=` 字段
+        （源码 agent/turn_usage.py:191 `if canonical_usage.cache_read_tokens and ...`）
+      · 所以「没有 cache=」= **没拿到缓存明细**，不等于「真的没命中缓存」
+      · 旧逻辑把两者当一回事 → 这批调用的整段 prompt 被按最贵的「未命中」计价
+        （未命中 0.092 是缓存 0.00184 的 50 倍）
+      · 实测频率：10-01 只有 1 次（两边差 −2.5%，对得上）；10-03 涨到 22 次，
+        当天账被推高 4%。有过明细的调用**逐条与站方完全一致**，问题只在这批。
+
+    做法：拿这些调用的「总 prompt + 输出」去 store.db 里找**完全相等**的那条流水
+      （两边时间戳有 20~30 秒系统偏移，所以不能只靠时间，必须数值相等才算命中），
+      用站方的缓存值补齐。
+    站方没有（还没采到 / 采集断档）→ **不改数字**，只如实计数（不凭空估，
+      免得把一个"多算"换成另一个"少算"）。站方恢复后会自动回溯补上。
+
+    返回 {"fix": 补回的缓存 token, "matched": 修了几次, "missing": 几次没数据}
+    """
+    noinfo = [c for c in (calls or []) if c.get("noinfo")]
+    if not noinfo:
+        return {"fix": 0, "matched": 0, "missing": 0}
+
+    pm_db = os.path.join(_get_proxy_monitor_dir(), "store.db")
+    # ⚠️ 2026-10-03 自查：缓存 key 必须含站点监控库的 mtime，否则站方采集恢复、
+    #    补回那条流水之后，缓存仍返回旧的 fix/matched/missing（金额长时间不更新
+    #    且毫无提示）。key 里并入库文件签名即可。
+    key = (sid, len(calls or []), tuple(c.get("n") for c in noinfo),
+           _file_mtime(pm_db))
+    hit = _CACHE_FIX_CACHE.get(key)
+    if hit is not None:
+        return hit
+
+    flows = []
+    if os.path.isfile(pm_db):
+        try:
+            con = sqlite3.connect("file:%s?mode=ro" % pm_db.replace("\\", "/"), uri=True)
+            for idx, (ts, i, cr, o) in enumerate(con.execute(
+                    "SELECT ts, in_tokens, cache_read, out_tokens FROM usage_flows "
+                    "WHERE request_id NOT LIKE 'sub2api-%'")):
+                flows.append((idx, float(ts or 0), int(i or 0), int(cr or 0), int(o or 0)))
+            con.close()
+        except Exception:
+            flows = []
+
+    fix = matched = 0
+    used = set()          # ⚠️ 已消费的流水下标：同一份 cache_read 不能补两次
+    for c in noinfo:
+        try:
+            t = datetime.strptime(c["ts"], "%Y-%m-%d %H:%M:%S").timestamp()
+        except Exception:
+            continue
+        want_total, want_out = c["in"], c["out"]
+        best = None
+        for idx, ts, i, cr, o in flows:
+            # ⚠️ 2026-10-03 自查：原来是「只挑时间最近的一条」，同一 300 秒内出现
+            #    两条 token 完全相同的流水（连续两次相同 prompt / 重试）时，两条缺
+            #    明细调用会把**同一条**流水各匹配一次 → 缓存量被加两遍（少算钱）。
+            #    这里改成一条流水只能被消费一次。
+            if idx in used:
+                continue
+            if i + cr != want_total or o != want_out:
+                continue
+            d = abs(ts - t)
+            if d <= _CACHE_FIX_TOL_S and (best is None or d < best[0]):
+                best = (d, cr, idx)
+        if best is not None:
+            used.add(best[2])
+            fix += best[1]
+            matched += 1
+    res = {"fix": fix, "matched": matched, "missing": len(noinfo) - matched}
+    if len(_CACHE_FIX_CACHE) > 64:
+        _CACHE_FIX_CACHE.clear()
+    _CACHE_FIX_CACHE[key] = res
+    return res
 
 
 # ─────────────────────────── 站方校准数据管理器 ───────────────────────────
@@ -1089,8 +1774,21 @@ class CalibManager:
         return self._data
 
     def get_session_calib(self, sid):
+        """该会话的站方实付（★ 实时查库优先，文件快照降级为兜底）。
+
+        ⚠️ 2026-10-03 改：原来只读 `proxy_calibration.json` 快照。但归集每轮
+        重跑，快照会作废（实测库 664 条 ¥1.4654 vs 快照 676 条 ¥1.4823，
+        那 12 条库里根本不存在）→ 悬浮窗数字永久高于站点监控。
+        现在直接查库，和面板同源同时刻；库读不到才退回文件。
+        """
         if not self.enabled or not sid:
             return None
+        live = site_truth_session(sid)
+        if live:
+            return {"cost": live["cost"], "calls": live["calls"],
+                    "in_tokens": live["in"], "cache_read": live["cache"],
+                    "out_tokens": live["out"], "sites": live["sites"],
+                    "last_ts": live["last_ts"], "src": "live"}
         data = self.load()
         if not data:
             return None
@@ -1098,18 +1796,22 @@ class CalibManager:
 
     def get_calibration_offset(self, sid, hermes_cost, hermes_cr, hermes_inp):
         """计算或获取该会话锁定的补差额。
-        
-        规则：
-          - 站方同步时，锁定 补差 = 站方实扣 - hermes检测；
-          - 两次同步之间，无论 hermes 数据怎么上涨，补差锁定不动，直到下次同步；
+
+        规则（用户 2026-10-03 明确）：
+          - 站方同步时，锁定 补差 = 站方实扣 − hermes检测；
+          - 两次同步之间，hermes 自己涨的那部分照加（显示 = hermes + 锁定的补差），
+            这样站点没更新时价格也能跟着涨，不会"一直不涨价"；
+          - 下次站方数据推进时，用新的站方值重算补差；
           - 若站方无数据，返回 None。
+
+        ⚠️ 2026-10-03 同时改了**站方值的来源**：原来只读 proxy_calibration.json
+        快照，但归集每轮重跑会让快照作废（实测库 664 条 ¥1.4654 vs 快照
+        676 条 ¥1.4823，那 12 条库里根本不存在）→ 悬浮窗永久高于站点监控。
+        现在优先实时查库（与 panel.py 同口径），查不到才退回快照。
         """
         if not self.enabled or not sid:
             return None
-        data = self.load()
-        if not data:
-            return None
-        site_sess = data.get("sessions", {}).get(sid)
+        site_sess = self.get_session_calib(sid)
         if not site_sess:
             return None
 
@@ -1137,8 +1839,14 @@ class CalibManager:
         return cached
 
     def get_daily_calib(self, day, host=None):
+        """某天各站的站方实付（★ 实时查库优先，与 panel.py 同口径）。"""
         if not self.enabled:
             return None
+        live = site_truth_daily(day)
+        if live:
+            if host:
+                return live.get(canon_host(host))
+            return live
         data = self.load()
         if not data:
             return None
@@ -1730,6 +2438,12 @@ class Ledger:
                 "ts": ts, "n": int(m.group("n")),
                 "in": int(m.group("in")), "out": int(m.group("out")),
                 "hit": int(cm.group(1)) if cm else 0,
+                # ⚠️ 2026-10-03：agent.log 只在 cache_read_tokens 非零时才打印 cache= 字段
+                #    （源码 turn_usage.py:191）。所以「没有 cache=」= 这次调用**没拿到缓存
+                #    明细**，不是「真的没命中缓存」。以前把两者当一回事，导致这些调用被
+                #    按最贵的「未命中」计价（未命中单价是缓存的 50 倍）。
+                #    实测：10-01 只有 1 次这种调用，10-03 涨到 22 次，把当天账推高 4%。
+                "noinfo": cm is None,
             }
             self._stat(sid)["calls"].append(rec)
             self.events.append((ts, "call", sid, rec))
@@ -1771,14 +2485,6 @@ class Ledger:
             if t and (time.time() - t) < grace_sec:
                 pend.pop()
         return pend[-limit:]
-
-    def in_flight(self, sid, grace_sec=90):
-        """最后一个 created 是否可能仍在进行中（刚发出、还没记账）。"""
-        pend = self.unmatched(sid, grace_sec=0)
-        if not pend:
-            return False
-        t = _ts_to_epoch(pend[-1])
-        return bool(t and (time.time() - t) < grace_sec)
 
     def concurrent_at(self, sid, ts, window=120):
         """该时刻附近是否有其它会话的回合（归属可能不准 → 降级）。"""
@@ -1995,6 +2701,35 @@ class Monitor:
         return row[0] if row else None
 
     # ---------- session info ----------
+    def session_sites_models(self, sid):
+        """该会话真正用过的全部 (站, 模型) —— 来自 session_model_usage，可多行。
+
+        ⚠️ 为什么需要它（2026-10-03）：`sessions` 表每个会话只有**一行**主记录，
+        只记得最后一次的 billing_base_url / model。实际一个会话可以先后用多个站、
+        多个模型（实测 20261003_021807_4dc91e：dshapi 349 次 + 示例站 118 次），
+        只读主记录会把其它站整个漏掉。这里按站×模型聚合，供悬浮窗全部列出来。
+        """
+        out = []
+        try:
+            for burl, prov, model, n, i, cr, o in db_query(
+                    "SELECT billing_base_url, billing_provider, model, "
+                    "COALESCE(SUM(api_call_count),0), COALESCE(SUM(input_tokens),0), "
+                    "COALESCE(SUM(cache_read_tokens),0), COALESCE(SUM(output_tokens),0) "
+                    "FROM session_model_usage WHERE session_id=? "
+                    "GROUP BY billing_base_url, billing_provider, model "
+                    "ORDER BY 4 DESC", (sid,)):
+                try:
+                    site = canon_host(urlparse(burl).hostname or prov or "?")
+                except Exception:
+                    site = canon_host(prov or "?")
+                out.append({"site": site,
+                            "model": canon_model(model or "?"),
+                            "calls": int(n or 0),
+                            "in": int(i or 0), "hit": int(cr or 0), "out": int(o or 0)})
+        except Exception:
+            pass
+        return out
+
     def _session_info(self, sid):
         row = db_query(
             "SELECT title, model, billing_provider, billing_base_url, "
@@ -2241,6 +2976,22 @@ class Monitor:
         """组装某会话的完整展示数据（成本 + 子代理 + 缺账）。"""
         d = self._session_info(sid)
         d["source"] = source
+        # ★「缓存明细缺失」修正（2026-10-03，见 _cache_detail_fix 说明）：
+        #   把"没拿到缓存明细"的调用按站方逐条值补回缓存，从未命中里扣掉。
+        #   只在站方有对应流水时才动数字；没有就如实计数（不改数、不硬估）。
+        d["cache_fix"] = {"fix": 0, "matched": 0, "missing": 0}
+        try:
+            _st = (self.ledger.stat(sid) or {}).get("calls") or []
+            _fx = _cache_detail_fix(sid, _st)
+            if _fx["fix"] > 0:
+                _take = min(int(_fx["fix"]), int(d["inp"]))
+                d["inp"] -= _take
+                d["cr"] += _take                  # 总量不变，只把归属从"未命中"挪回"缓存"
+                if (d["inp"] + d["cr"]) > 0:
+                    d["rate"] = d["cr"] * 100.0 / (d["inp"] + d["cr"])
+            d["cache_fix"] = _fx
+        except Exception:
+            pass
         now_hm = datetime.now().strftime("%H:%M")
 
         entry = self.prices.match(d["site"], d["model"])
@@ -3127,7 +3878,7 @@ class CostLedger:
                 h = canon_host(urlparse(host).hostname or h)
             except Exception:
                 pass
-            key = "%s|%s" % (h, model)
+            key = "%s|%s" % (h, canon_model(model))
             k = out.setdefault(key, {"calls": 0, "in": 0, "hit": 0, "out": 0})
             k["calls"] += calls or 0
             k["in"] += inp or 0
@@ -3164,6 +3915,18 @@ class CostLedger:
         """
         days = self.data.get("days") or {}
         hm = self._settle_hm()
+        # ⚠️ 2026-10-03 加的保险：没有价格表时重算 = 把**全部金额清成「缺价」**，
+        #    这是一次数据事故（实测把 196 条全写成了 None）。宁可不算，也不动。
+        if self.prices is None:
+            try:
+                self.prices = PriceBook()
+                self.prices.load(force=True)
+            except Exception:
+                self.prices = None
+        if self.prices is None:
+            return {"scanned": 0, "priced": 0, "unpriced": 0, "skipped": 0, "changed": 0,
+                    "mode": mode, "hm": hm,
+                    "error": "没有加载价格表，已放弃重算（否则会把全部金额清空）"}
         scanned = priced = unpriced = skipped = changed = 0
         for day, rec in days.items():
             if not isinstance(rec, dict):
@@ -3174,6 +3937,7 @@ class CostLedger:
                 try:
                     host, model = key.split("|", 1)
                     host = canon_host(host)
+                    model = canon_model(model)
                 except ValueError:
                     continue
                 if mode == "missing" and v.get("cost") is not None:
@@ -3205,6 +3969,49 @@ class CostLedger:
                                        "changed": changed, "mode": mode, "hm": hm}
         self.save()
         return dict(self.data["recompute_stat"])
+
+    def regroup(self):
+        """按「站点归并表」把账本里所有天的键重新分组（别名合并求和）。
+
+        为什么必须单独一步：`recompute` 只按 key 取价、**不改 key**。归并规则
+        新增后，历史各天里同一家中转站的多个域名仍是各自独立的键
+        （如 10-01 的 api4.dshapi.icu 与 api.dshapi.icu 各记一笔），不重新分组
+        就永远显示成两个站、各算一份钱。
+        返回 dict(days, merged, changed)
+        """
+        days = self.data.get("days") or {}
+        stat = {"days": 0, "merged": 0, "changed": 0}
+        for day, rec in days.items():
+            if not isinstance(rec, dict) or not rec:
+                continue
+            stat["days"] += 1
+            new = {}
+            for key, v in rec.items():
+                if not isinstance(v, dict):
+                    continue
+                h, sep, m = str(key).partition("|")
+                nk = ("%s|%s" % (canon_host(h), canon_model(m))) if sep else canon_host(h)
+                t = new.get(nk)
+                if t is None:
+                    t = new[nk] = {"calls": 0, "in": 0, "hit": 0, "out": 0, "cost": None}
+                for f in ("calls", "in", "hit", "out"):
+                    try:
+                        t[f] += int(v.get(f) or 0)
+                    except (TypeError, ValueError):
+                        pass
+                c = v.get("cost")
+                if isinstance(c, (int, float)):
+                    t["cost"] = float(t["cost"] or 0.0) + float(c)
+            if len(new) != len(rec):
+                stat["changed"] += 1
+                stat["merged"] += len(rec) - len(new)
+            days[day] = new
+        # 水位键一并归一（防止残留别名键在将来被当成增量重记一次）
+        wm = self.data.get("watermark") or {}
+        if isinstance(wm.get("keys"), dict):
+            wm["keys"] = _norm_watermark_keys(wm["keys"])
+        self.save()
+        return stat
 
     # ---------- 实付锚点（站方账单 → 校准历史 / 反推倍率） ----------
     def add_bill(self, bill):
@@ -3363,7 +4170,9 @@ class CostLedger:
     def settle(self, day):
         """把「上次水位 → 现在」的差值累加记入 *day*，并推进水位。"""
         wm = self._watermark()
-        prev = self.data["watermark"].get("keys") or {}
+        # ⚠️ 旧水位键可能残留「未归一的域名」（见 _norm_watermark_keys 的踩坑注释）。
+        #    不归一就会出现「同一批用量被记两天」的幽灵账，所以读的时候一并归一。
+        prev = _norm_watermark_keys(self.data["watermark"].get("keys") or {})
         dayrec = self.data["days"].setdefault(day, {})
         moved = 0
         for key, cur in wm.items():
@@ -3373,6 +4182,7 @@ class CostLedger:
                 continue
             moved += 1
             host, model = key.split("|", 1)
+            host, model = canon_host(host), canon_model(model)
             cost, ratio, seg = self._price_cost(host, model, d, day=day)
             tgt = dayrec.setdefault(key, {"calls": 0, "in": 0, "hit": 0, "out": 0, "cost": 0.0})
             for f in ("calls", "in", "hit", "out"):
@@ -3432,6 +4242,7 @@ class CostLedger:
                 h = canon_host(urlparse(host).hostname or h)
             except Exception:
                 pass
+            model = canon_model(model)
             key = "%s|%s" % (h, model)
             a = agg.setdefault(key, {"calls": 0, "in": 0, "hit": 0, "out": 0,
                                      "cost": 0.0, "unpriced": False})
@@ -3447,32 +4258,134 @@ class CostLedger:
                 a["cost"] += c["cost"]
         return agg
 
+    # ---------- 站方真值优先 ----------
+    @staticmethod
+    def _window_days(since_ts):
+        """窗口覆盖到的自然日列表（'YYYY-MM-DD'）；since_ts 为空 = 不限。"""
+        if not since_ts:
+            return None
+        d0 = datetime.fromtimestamp(since_ts).date()
+        d1 = datetime.now().date()
+        out, d = [], d0
+        while d <= d1:
+            out.append(d.isoformat())
+            d += timedelta(days=1)
+        return out
+
+    @staticmethod
+    def _truth_hosts(days_list, td):
+        """{day: {有站方流水的站,...}} —— 全 0 行不算「有流水」。"""
+        out = {}
+        for d in (days_list or []):
+            out[d] = {k.split("|", 1)[0] for k, v in (td.get(d) or {}).items()
+                      if (v.get("calls") or v.get("in") or v.get("hit")
+                          or v.get("out") or v.get("cost"))}
+        return out
+
+    @staticmethod
+    def _put_truth(acc, keys_vals, hosts):
+        """把站方真值（只限 hosts 里的站）放进聚合，打 src=site。
+
+        ⚠️ 2026-10-03 自查：跳过「全 0」的站方行。站方库里可能出现某些 key
+        （比如未使用 key 的占位、或按模型汇总的空行）带 0 用量 —— 如果照收，
+        就会把该站当天的 Hermes 估算整体替换成 0（有键即覆盖），等于凭空抹账。
+        """
+        for k, v in (keys_vals or {}).items():
+            if k.split("|", 1)[0] not in hosts:
+                continue
+            if not (v.get("calls") or v.get("in") or v.get("hit")
+                    or v.get("out") or v.get("cost")):
+                continue                      # 全 0 行不进账
+            a = acc.setdefault(k, {"calls": 0, "in": 0, "hit": 0, "out": 0,
+                                   "cost": 0.0, "unpriced": False,
+                                   "unpriced_hist": False})
+            for f in ("calls", "in", "hit", "out"):
+                a[f] = (a.get(f) or 0) + v[f]
+            a["cost"] = (a.get("cost") or 0.0) + v["cost"]
+            a["src"] = "site"
+            # ⚠️ 站方流水里 cost 为 NULL = 「这笔还没结算出金额」，不能当成 0 元实付。
+            #    标成缺价，界面才会提示而不是显示一个假的 0。
+            if v.get("cost_missing"):
+                a["unpriced_site"] = True
+
     # ---------- 查询入口 ----------
     def report(self, win):
-        """win: '24h'|'today'|'7d'|'30d'|'all' → (agg, source_label)"""
+        """win: '24h'|'today'|'7d'|'30d'|'all' → (agg, source_label)
+
+        ★站方真值优先（2026-10-03）：站方监控有流水的「站·天」，直接用站方实际
+          收的钱（= 实付）；站方没覆盖到的（采集失效 / 超出保留期）才退回 Hermes 估算。
+        ⚠️ 必须**按天**替换，不能按整个窗口替换：站方库只留 7 天、账本有几十天，
+           整体替换会把站方没覆盖的天一起抹掉（会少算）。
+        """
         now = datetime.now()
-        if win == "24h":
-            return self.live(since_ts=time.time() - 86400), "实时"
         today0 = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        if win == "today":
-            return self.live(since_ts=today0.timestamp()), "实时"
+        today = today0.strftime("%Y-%m-%d")
+        td = site_truth_days()
+        seen_site, seen_hermes = set(), set()
+
+        if win in ("24h", "today"):
+            since = (time.time() - 86400) if win == "24h" else today0.timestamp()
+            acc = self.live(since_ts=since)
+            # ★ 用带 ts 下界的站方聚合，而不是「按天抽表」。
+            #   ⚠️ 2026-10-03 自查：24h 是**滚动**窗口，而按天抽表拿的是整天流水；
+            #   昨天更早时段、前天尾段的用量会被算进 24h，导致显示金额高于真实实付。
+            #   today 是自然日窗口，才可以用按天口径。
+            if win == "today":
+                days_list = self._window_days(since) or []
+                per_day = self._truth_hosts(days_list, td)
+                full = set.intersection(*per_day.values()) if per_day else set()
+                if full:
+                    for k in list(acc):
+                        if k.split("|", 1)[0] in full:
+                            del acc[k]
+                    for d in days_list:
+                        if _day_in_scope(d, set(days_list)):
+                            self._put_truth(acc, td.get(d) or {}, full)
+            else:
+                truth = site_truth_agg(since)
+                if truth:
+                    hosts = {k.split("|", 1)[0] for k, v in truth.items()
+                             if (v.get("calls") or v.get("in") or v.get("hit")
+                                 or v.get("out") or v.get("cost"))}
+                    for k in list(acc):
+                        if k.split("|", 1)[0] in hosts:
+                            del acc[k]
+                    self._put_truth(acc, truth, hosts)
+            seen_site |= {k.split("|", 1)[0] for k, v in acc.items()
+                          if v.get("src") == "site"}
+            seen_hermes |= {k.split("|", 1)[0] for k in acc} - seen_site
+            self.last_srcs = {"site": seen_site, "hermes": seen_hermes}
+            return acc, ("实时" + ("·站方优先" if seen_site else ""))
+
         n = {"7d": 7, "30d": 30, "all": None}.get(win, 7)
         acc = {}
         approx_hit = False
         for day, rec in (self.data.get("days") or {}).items():
+            # ⚠️ 2026-10-03 修：原来只判 `(now - dd).days >= n`。那个减法带着时刻，
+            #    未来日期会算出**负数** → 条件恒假 → 未来日期不但不被跳过，还会被
+            #    30d/all 累加进账本聚合。改成先挡掉「不晚于今天」之外的日期。
+            if not _day_in_scope(day, None):
+                continue
             if n is not None:
                 try:
                     dd = datetime.strptime(day, "%Y-%m-%d")
                 except ValueError:
                     continue
-                if (now - dd).days >= n:
+                if (now.date() - dd.date()).days >= n:
                     continue
                 if day in (self.data.get("approx") or []):
                     approx_hit = True
+            # ⚠️ 只把「这天确实有非 0 站方用量」的站算作已覆盖；全 0 行不能把
+            #    Hermes 估算顶掉（否则等于凭空抹账，见 _put_truth 的说明）
+            day_hosts = {k.split("|", 1)[0] for k, v in (td.get(day) or {}).items()
+                         if (v.get("calls") or v.get("in") or v.get("hit")
+                             or v.get("out") or v.get("cost"))}
             for key, v in rec.items():
                 parts = key.split("|", 1)
                 if len(parts) == 2:
-                    key = "%s|%s" % (canon_host(parts[0]), parts[1])
+                    key = "%s|%s" % (canon_host(parts[0]), canon_model(parts[1]))
+                if key.split("|", 1)[0] in day_hosts:
+                    continue              # 这天这个站有站方真值 → 跳过 Hermes 估算
                 a = acc.setdefault(key, {"calls": 0, "in": 0, "hit": 0, "out": 0,
                                          "cost": 0.0, "unpriced": False,
                                          "unpriced_hist": False})
@@ -3489,7 +4402,12 @@ class CostLedger:
                 else:
                     a["cost"] += v["cost"]
         # 叠加「今天的实时」（账本只记到昨天，不会重复）
+        today_hosts = {k.split("|", 1)[0] for k, v in (td.get(today) or {}).items()
+                       if (v.get("calls") or v.get("in") or v.get("hit")
+                           or v.get("out") or v.get("cost"))}
         for key, v in self.live(since_ts=today0.timestamp()).items():
+            if key.split("|", 1)[0] in today_hosts:
+                continue
             a = acc.setdefault(key, {"calls": 0, "in": 0, "hit": 0, "out": 0,
                                      "cost": 0.0, "unpriced": False,
                                      "unpriced_hist": False})
@@ -3497,7 +4415,272 @@ class CostLedger:
                 a[f] += v.get(f) or 0
             a["cost"] += v.get("cost") or 0
             a["unpriced"] = a["unpriced"] or v.get("unpriced", False)
-        return acc, ("账本" + ("+≈近似" if approx_hit else ""))
+        # 放站方真值（只放窗口内、且站方确实有流水的那些天）
+        win_days = self._window_days(
+            (today0.timestamp() - (n - 1) * 86400) if n else None)
+        day_set = set(win_days) if win_days else None
+        for d, blob in td.items():
+            if not _day_in_scope(d, day_set):
+                continue
+            hosts = {k.split("|", 1)[0] for k, v in blob.items()
+                     if (v.get("calls") or v.get("in") or v.get("hit")
+                         or v.get("out") or v.get("cost"))}
+            self._put_truth(acc, blob, hosts)
+        seen_site |= {k.split("|", 1)[0] for k, v in acc.items()
+                      if v.get("src") == "site"}
+        seen_hermes |= {k.split("|", 1)[0] for k in acc} - seen_site
+        self.last_srcs = {"site": seen_site, "hermes": seen_hermes}
+        return acc, ("账本" + ("+≈近似" if approx_hit else "")
+                     + ("·站方优先" if seen_site else ""))
+
+
+class SiteMergeDialog:
+    """站点 / 模型 名归并设置（点选式）。
+
+    为什么要它：账本按 `host|model` 记账，而同一个中转站常有多个入口域名
+    （dshapi 的 api / api2 / api4）、同一个模型也常被写成不同名字
+    （`deepseek/deepseek-v4.1-flash`、`[a]gemini-3.8-flash`）。不归并就会被
+    拆成好几行各算一份，价格匹配也可能落空。
+
+    操作：左边选「要归并的名字」，右边选「并到哪个」（下拉里列出账本里已有的
+    全部名字），点「加入」；最后点「保存并重算历史」。
+    """
+
+    def __init__(self, root, ledger):
+        self.ledger = ledger
+        raw = load_name_merge_raw()
+        self.rules_site = {k: v for k, v in raw["sites"].items() if k != v}
+        self.rules_model = {k: v for k, v in raw["models"].items() if k != v}
+        self.auto_sites = _auto_site_merge()
+        self.auto_models = _auto_model_merge()
+        self._keys_site, self._keys_model = [], []
+
+        self.win = tk.Toplevel(root)
+        self.win.title("站点与模型归并")
+        self.win.configure(bg=BG)
+        self.win.attributes("-topmost", True)
+        apply_icon(self.win)
+        apply_dark_title_bar(self.win, bg_hex=BG)
+        self.win.transient(root)
+        self.win.geometry("780x600")
+
+        tk.Label(self.win,
+                 text="把同一家的多个名字合并成一个 —— 账本、价格、显示都用合并后的名字。",
+                 bg=BG, fg=FG, font=FONT).pack(anchor="w", padx=14, pady=(12, 2))
+        tk.Label(self.win,
+                 text="左边选「要归并的名字」，右边选「并到哪个」（下拉里是账本里已有的全部名字），点「加入」。",
+                 bg=BG, fg=DIM, font=FONT_S).pack(anchor="w", padx=14)
+
+        def _row(lab, vals, cmd):
+            f = tk.Frame(self.win, bg=BG)
+            f.pack(fill="x", padx=14, pady=(8, 0))
+            tk.Label(f, text=lab, bg=BG, fg=FG, font=FONT_S, width=5,
+                     anchor="w").pack(side="left")
+            a = ttk.Combobox(f, values=vals, width=30, font=FONT_S)
+            a.pack(side="left")
+            tk.Label(f, text="  →  ", bg=BG, fg=DIM, font=FONT_S).pack(side="left")
+            b = ttk.Combobox(f, values=vals, width=30, font=FONT_S)
+            b.pack(side="left")
+            tk.Button(f, text="＋ 加入", bd=0, font=FONT_S, bg="#2f5d3a", fg=FG,
+                      activebackground="#3a7248", activeforeground=FG,
+                      command=cmd).pack(side="left", padx=8)
+            return a, b
+
+        sites = self._collect("site")
+        models = self._collect("model")
+        self.cb_s_from, self.cb_s_to = _row("站点", sites, self._add_site)
+        self.cb_m_from, self.cb_m_to = _row("模型", models, self._add_model)
+
+        mid = tk.Frame(self.win, bg=BG)
+        mid.pack(fill="both", expand=True, padx=14, pady=(10, 0))
+        self.lb_site, self.lb_model = self._make_lists(mid)
+
+        auto = tk.Frame(self.win, bg=BG)
+        auto.pack(fill="x", padx=14, pady=(8, 0))
+        self.var_align = tk.BooleanVar(value=bool(raw["auto_align"]))
+        self.var_model = tk.BooleanVar(value=bool(raw["auto_model"]))
+        tk.Checkbutton(auto,
+                       text="自动对齐站点监控（读 sites.json 的域名池，把别名并入该站 host；当前 %d 条）"
+                            % len(self.auto_sites),
+                       variable=self.var_align, bg=BG, fg=FG, font=FONT_S,
+                       activebackground=BG, activeforeground=FG, selectcolor="#2a2a30",
+                       highlightthickness=0, bd=0, anchor="w").pack(anchor="w")
+        tk.Checkbutton(auto,
+                       text="自动归并模型名（剥开头的 [频道] 与 provider/ 前缀，只认已知标准名；当前 %d 条）"
+                            % len(self.auto_models),
+                       variable=self.var_model, bg=BG, fg=FG, font=FONT_S,
+                       activebackground=BG, activeforeground=FG, selectcolor="#2a2a30",
+                       highlightthickness=0, bd=0, anchor="w").pack(anchor="w")
+        _al = "、".join("%s→%s" % kv for kv in sorted(self.auto_sites.items())[:4])
+        _am = "、".join("%s→%s" % kv for kv in sorted(self.auto_models.items())[:4])
+        tk.Label(auto, text="站点自动：%s%s\n模型自动：%s%s" % (
+            _al or "无", " …" if len(self.auto_sites) > 4 else "",
+            _am or "无", " …" if len(self.auto_models) > 4 else ""),
+            bg=BG, fg=DIM, font=FONT_S, justify="left").pack(anchor="w", pady=(2, 0))
+
+        self.lbl = tk.Label(self.win, text="", bg=BG, fg=YELLOW, font=FONT_S,
+                            anchor="w", justify="left", wraplength=750)
+        self.lbl.pack(fill="x", padx=14, pady=(6, 0))
+
+        bar = tk.Frame(self.win, bg=BG)
+        bar.pack(fill="x", padx=14, pady=(6, 12))
+        tk.Button(bar, text="保存并重算历史", bg="#2f5d3a", fg=FG, bd=0, font=FONT_S,
+                  activebackground="#3a7248", activeforeground=FG,
+                  command=lambda: self._save(True)).pack(side="left")
+        tk.Button(bar, text="仅保存", bg="#2a2a30", fg=FG, bd=0, font=FONT_S,
+                  activebackground="#333", activeforeground=FG,
+                  command=lambda: self._save(False)).pack(side="left", padx=6)
+        tk.Button(bar, text="取消", bg="#2a2a30", fg=FG, bd=0, font=FONT_S,
+                  activebackground="#333", activeforeground=FG,
+                  command=self.win.destroy).pack(side="left")
+        tk.Label(bar, text="  重算 = 按新规则重新分组 + 按天重算金额（不改 token）",
+                 bg=BG, fg=DIM, font=FONT_S).pack(side="left")
+
+        self._refresh_lists()
+
+    # -------- 候选名字（账本里出现过的）--------
+    def _collect(self, kind):
+        cnt = {}
+        for _d, rec in (self.ledger.data.get("days") or {}).items():
+            for k in (rec or {}):
+                parts = str(k).split("|", 1)
+                n = parts[0] if kind == "site" else (parts[1] if len(parts) > 1 else "")
+                if n and n != "?":
+                    cnt[n] = cnt.get(n, 0) + 1
+        # 水位里有、但当天还没入账的（刚用上的新名字）
+        wm = ((self.ledger.data.get("watermark") or {}).get("keys")) or {}
+        for k in wm:
+            parts = str(k).split("|", 1)
+            n = parts[0] if kind == "site" else (parts[1] if len(parts) > 1 else "")
+            if n and n not in cnt:
+                cnt[n] = 0
+        # ★Hermes 库里现用的名字：刚加的新站账本还没结算，这里也能立刻选到
+        try:
+            for h, m in _db_hosts_models():
+                n = h if kind == "site" else m
+                if n and n not in cnt:
+                    cnt[n] = 0
+        except Exception:
+            pass
+        names = sorted(cnt, key=lambda x: (-cnt[x], x))
+        seen = set(cnt)
+        rules = self.rules_site if kind == "site" else self.rules_model
+        autos = self.auto_sites if kind == "site" else self.auto_models
+        for d in (rules, autos):
+            for k, v in d.items():
+                for n in (k, v):
+                    if n and n not in seen:
+                        seen.add(n)
+                        names.append(n)
+        return names
+
+    def _make_lists(self, parent):
+        out = []
+        for title, deleter in (("站点归并规则", self._del_site),
+                               ("模型归并规则", self._del_model)):
+            col = tk.Frame(parent, bg=BG)
+            col.pack(side="left", fill="both", expand=True, padx=(0, 8))
+            tk.Label(col, text=title, bg=BG, fg=DIM, font=FONT_S).pack(anchor="w")
+            box = tk.Frame(col, bg=BG)
+            box.pack(fill="both", expand=True)
+            sb = tk.Scrollbar(box)
+            sb.pack(side="right", fill="y")
+            lb = tk.Listbox(box, bg="#1e1e24", fg=FG, font=FONT_S, bd=0, height=9,
+                            highlightthickness=1, highlightbackground="#3a3a42",
+                            selectbackground="#2f5d3a", selectforeground=FG,
+                            yscrollcommand=sb.set)
+            lb.pack(side="left", fill="both", expand=True)
+            sb.config(command=lb.yview)
+            tk.Button(col, text="删除选中", bd=0, font=FONT_S, bg="#2a2a30", fg=FG,
+                      activebackground="#333", activeforeground=FG,
+                      command=deleter).pack(anchor="e", pady=(2, 0))
+            out.append(lb)
+        return out
+
+    def _refresh_lists(self):
+        keys = []
+        for lb, rules in ((self.lb_site, self.rules_site), (self.lb_model, self.rules_model)):
+            lb.delete(0, "end")
+            ks = sorted(rules)
+            for k in ks:
+                lb.insert("end", "%-26s → %s" % (k, rules[k]))
+            keys.append(ks)
+        self._keys_site, self._keys_model = keys
+
+    def _msg(self, t, warn=True):
+        self.lbl.config(text=t, fg=(YELLOW if warn else FG))
+
+    # -------- 加 / 删 --------
+    def _add_site(self):
+        self._add_rule((self.cb_s_from.get() or "").strip(),
+                       (self.cb_s_to.get() or "").strip(), self.rules_site, "站点")
+
+    def _add_model(self):
+        self._add_rule((self.cb_m_from.get() or "").strip(),
+                       (self.cb_m_to.get() or "").strip(), self.rules_model, "模型")
+
+    def _add_rule(self, a, b, rules, kind):
+        if not a or not b:
+            self._msg("「%s」两边都要选：左边=要归并的名字，右边=并到哪个。" % kind)
+            return
+        if a.lower() == b.lower():
+            self._msg("两边一样，不需要归并。")
+            return
+        tgt, seen = b, {a.lower()}
+        for _ in range(20):                 # 顺着链走到终点，避免 A→B→C
+            nx = rules.get(tgt.lower())
+            if not nx or nx.lower() in seen:
+                break
+            seen.add(nx.lower())
+            tgt = nx
+        rules[a.lower()] = tgt
+        for k, v in list(rules.items()):    # 已经指向 a 的旧规则一起改道（别留悬空链）
+            if k != a.lower() and v.lower() == a.lower():
+                rules[k] = tgt
+        self._refresh_lists()
+        self._msg("已加入：%s → %s   （点「保存并重算历史」生效）" % (a, tgt), warn=False)
+
+    def _del_site(self):
+        for i in reversed(self.lb_site.curselection()):
+            if i < len(self._keys_site):
+                self.rules_site.pop(self._keys_site[i], None)
+        self._refresh_lists()
+
+    def _del_model(self):
+        for i in reversed(self.lb_model.curselection()):
+            if i < len(self._keys_model):
+                self.rules_model.pop(self._keys_model[i], None)
+        self._refresh_lists()
+
+    # -------- 存 --------
+    def _save(self, then_recompute):
+        try:
+            path = save_name_merge(sites=self.rules_site, models=self.rules_model,
+                                   auto_align=bool(self.var_align.get()),
+                                   auto_model=bool(self.var_model.get()))
+        except Exception as ex:
+            messagebox.showerror("保存失败", str(ex), parent=self.win)
+            return
+        msg = ("已写入：\n%s\n\n手动规则：站点 %d 条 ｜ 模型 %d 条\n"
+               "自动对齐站点：%s ｜ 自动归并模型：%s" % (
+                   path, len(self.rules_site), len(self.rules_model),
+                   "开" if self.var_align.get() else "关",
+                   "开" if self.var_model.get() else "关"))
+        if then_recompute:
+            try:
+                if getattr(self.ledger, "prices", None) is None:
+                    self.ledger.prices = PriceBook()
+                    self.ledger.prices.load(force=True)
+                st = self.ledger.regroup()
+                rs = self.ledger.recompute("day")
+                msg += ("\n\n重新分组：%d 天，合并 %d 个重复键"
+                        "\n重算：扫描 %d 条，%d 条金额有变化") % (
+                    st.get("days", 0), st.get("merged", 0),
+                    rs.get("scanned", 0), rs.get("changed", 0))
+            except Exception as ex:
+                msg += "\n\n重算失败（配置已保存，可稍后手动重算）：%s" % ex
+        messagebox.showinfo("站点与模型归并", msg, parent=self.win)
+        self.win.destroy()
 
 
 class GapDialog:
@@ -3661,6 +4844,9 @@ class StatsDialog:
         tk.Button(bar, text="录入实付", bd=0, font=FONT_S, bg="#2a2a30", fg=FG,
                   activebackground="#3a3a44", activeforeground=FG,
                   command=self.enter_bill).pack(side="left", padx=4)
+        tk.Button(bar, text="站点归并…", bd=0, font=FONT_S, bg="#2a2a30", fg=FG,
+                  activebackground="#3a3a44", activeforeground=FG,
+                  command=self.open_site_merge).pack(side="left", padx=4)
         self.lbl_rc = tk.Label(bar, text="", bg=BG, fg=DIM, font=FONT_S, anchor="w")
         self.lbl_rc.pack(side="left", padx=8)
 
@@ -3729,6 +4915,12 @@ class StatsDialog:
         except tk.TclError:
             self._alive = False
 
+    def open_site_merge(self):
+        """站点归并设置：把同一家中转站的多个域名并成一个站名，并重算历史。"""
+        dlg = SiteMergeDialog(self.win, self.ledger)
+        self.win.wait_window(dlg.win)
+        self.refresh(force=True)
+
     def recompute_history(self):
         """重算历史：按天（推荐）/ 只补缺 / 全部按当前价 —— 三档，破坏性操作单独标红。"""
         dlg = tk.Toplevel(self.win)
@@ -3763,6 +4955,9 @@ class StatsDialog:
             messagebox.showerror("重算失败", str(ex), parent=self.win)
             return
         self.refresh()
+        if st.get("error"):
+            messagebox.showwarning("重算未执行", st["error"], parent=self.win)
+            return
         messagebox.showinfo(
             "重算完成",
             "模式：%s\n扫描 %d 条 ｜ 算出金额 %d 条 ｜ 仍缺价 %d 条\n跳过 %d 条 ｜ 数值有变化 %d 条%s" % (
@@ -3808,10 +5003,18 @@ class StatsDialog:
         except Exception:
             r = None
         lb = self.ledger.data or {}
+        # ★ 站点监控库也要盯（2026-10-03 自查发现）：站方真值优先之后，站方数据
+        #   变了而 Hermes 库没变时，表格里的数字其实已经过期 —— 不盯它就不刷新。
+        try:
+            store = os.path.join(_get_proxy_monitor_dir(), "store.db")
+            st_sig = (round(os.path.getmtime(store), 3), os.path.getsize(store)) \
+                if os.path.isfile(store) else None
+        except OSError:
+            st_sig = None
         return (self.cur, self.view, tuple(r) if r else None,
                 len(lb.get("days") or {}), lb.get("recomputed_at"),
                 len(lb.get("bills") or []),
-                (lb.get("watermark") or {}).get("day"))
+                (lb.get("watermark") or {}).get("day"), st_sig)
 
     def refresh(self, force=False):
         # 数据没变就不重建表格 —— 否则每 2 秒拆一次 30+ 行 Treeview，会顿卡 + 丢选中/滚动
@@ -3857,9 +5060,14 @@ class StatsDialog:
                 r["unpriced"] = True
             if v.get("unpriced_hist"):
                 r["unpriced_hist"] = True
+            if v.get("src") == "site":
+                r["src"] = "site"          # 该行数字来自站方真值（实付）
+            if v.get("unpriced_site"):
+                r["unpriced_site"] = True  # 站方那笔还没结算出金额
         total = sum(r["cost"] for r in rows.values())
         unpriced_live = 0      # 价格表里真没条目
         unpriced_hist = 0      # 账本里 cost=None（重算可消）
+        unpriced_site = 0      # 站方库里 cost 为空（那笔还没结算出金额）
         for (host, model), r in sorted(rows.items(), key=lambda kv: -kv[1]["calls"]):
             tot_in = r["in"] + r["hit"]
             rate = (r["hit"] * 100.0 / tot_in) if tot_in else 0.0
@@ -3880,11 +5088,17 @@ class StatsDialog:
                     unpriced_live += r["calls"]
                 if r["unpriced_hist"]:
                     unpriced_hist += r["calls"]
+                if r.get("unpriced_site"):
+                    unpriced_site += r["calls"]
+            mark = " ●" if r.get("src") == "site" else ""
             self.tree.insert("", "end", values=(
-                host, model or "（全部模型）", "{:,}".format(r["calls"]),
+                host + mark, model or "（全部模型）", "{:,}".format(r["calls"]),
                 "%.1f%%" % rate, "%s / %s" % (fmt_vol(r["hit"]), fmt_vol(r["in"])),
                 fmt_vol(r["out"]), cost_s, ("%.1f%%" % share) if total else "-"))
         notes = []
+        if unpriced_site:
+            notes.append("站方 %d 次调用尚未结算出金额（站方库里 cost 为空，先按 0 计）"
+                         % unpriced_site)
         if unpriced_live:
             notes.append("未配价 %d 次调用（价格表无此条目，去补配）" % unpriced_live)
         if unpriced_hist:
@@ -3894,6 +5108,14 @@ class StatsDialog:
             extra = "　⚠ " + "；".join(notes)
         if unpriced_live or unpriced_hist:
             extra += "　✱ 含缺价条目的行金额只算已配价部分"
+        # 数字来源标注：● = 站方真值（实付），无记号 = Hermes 估算
+        _srcs = getattr(self.ledger, "last_srcs", None) or {}
+        if _srcs.get("site"):
+            extra += "\n● 站方真值：" + "、".join(sorted(_srcs["site"]))
+        if _srcs.get("hermes"):
+            _hs = sorted(_srcs["hermes"])
+            extra += "　｜　其余为 Hermes 估算：" + "、".join(_hs[:6]) + (
+                " 等 %d 个" % len(_hs) if len(_hs) > 6 else "")
         # 锚点对照：站方实付 vs 本表估算（有锚点的站才显示）
         anchors = []
         for b in (self.ledger.data.get("bills") or []):
@@ -4623,7 +5845,7 @@ class App:
         self.mini_h = int(cfg.get("mini_h", 86))
 
         self.root = tk.Tk()
-        self.root.title("缓存跟随监控")
+        self.root.title("缓存跟随监控 v%s" % APP_VERSION)
         _startup_log("启动: icon_b64=%d, hermes_home=%s, data_dir=%s, no_uia=%s, profile=%s" % (
             len(_ICON_B64), HERMES_HOME or "(未找到)", WORK_DIR, _NO_UIA, _PROFILE))
         apply_icon(self.root)
@@ -4767,6 +5989,7 @@ class App:
         self.menu.add_command(label="🗕 切换精简/完整模式", command=self.toggle_mini_mode)
         self.menu.add_command(label="成本统计…", command=self.open_stats)
         self.menu.add_command(label="价格表管理…", command=self.on_cost_right)
+        self.menu.add_command(label="⚭ 站点归并设置…", command=self.open_site_merge)
         self.menu.add_command(label="🔄 重新对齐对话", command=self.do_refresh)
         self.menu.add_command(label="⚖ 重新加载站方校准", command=self.on_calib_click)
         self.menu.add_command(label="⚡ 从中转站实扣同步价格表", command=self.do_sync_proxy_prices)
@@ -5037,6 +6260,16 @@ class App:
     def open_stats(self):
         self._stats.append(StatsDialog(self.root, self.mon, on_close=self._stats_closed))
 
+    def open_site_merge(self):
+        """站点归并设置：把同一家中转站的多个域名并成一个「站名」。"""
+        ledger = getattr(self.mon, "cost_ledger", None)
+        if ledger is None:
+            messagebox.showerror("站点归并", "账本还没就绪，稍后再试。", parent=self.root)
+            return
+        dlg = SiteMergeDialog(self.root, ledger)
+        self.root.wait_window(dlg.win)
+        self.do_refresh()
+
     # -------- 提示注入（新增） --------
     def show_hint_menu(self):
         """每次弹出前重建子菜单：当前生效的预设打 ●。"""
@@ -5292,18 +6525,39 @@ class App:
             c_inp = d["inp"]
 
         today_str = datetime.now().strftime("%Y-%m-%d")
-        cur_sites = []
+        # ★ 该会话**真正用过**的全部站与模型（2026-10-03 修）
+        #   ⚠️ 原来只取 sessions 表那一行主记录的单个站，导致「一个会话用了两个站」
+        #   时只显示一个（实测 4dc91e：dshapi 349 次 + 示例站 118 次只露出 示例站）。
+        #   规矩：用过的站和模型都要列出来。主记录优先排前，其余按调用次数排。
+        cur_sites, cur_models = [], []
+        try:
+            _used = self.mon.session_sites_models(d["sid"])
+        except Exception:
+            _used = []
         host_main = canon_host(d.get("site")) if d.get("site") and d["site"] != "?" else None
+        model_main = canon_model(d.get("model")) if d.get("model") and d["model"] != "?" else None
         if host_main:
             cur_sites.append(host_main)
-        else:
-            # 仅在主站点未知时才尝试校准记录中的推测站点
+        if model_main:
+            cur_models.append(model_main)
+        for u in _used:
+            if u["site"] and u["site"] != "?" and u["site"] not in cur_sites:
+                cur_sites.append(u["site"])
+            if u["model"] and u["model"] != "?" and u["model"] not in cur_models:
+                cur_models.append(u["model"])
+        # 主站未知时，才退回校准记录里的推测站点
+        if not host_main:
             calib_raw = d.get("calib") or {}
             for s in calib_raw.get("sites") or []:
                 cs = canon_host(s)
                 if cs and cs != "?" and cs not in cur_sites:
                     cur_sites.append(cs)
 
+        # 每个站当天的站方实扣（今天有流水才带金额）
+        _cost_by_site = {}
+        for u in _used:
+            if u["site"] and u["site"] != "?":
+                _cost_by_site[u["site"]] = _cost_by_site.get(u["site"], 0) + u["calls"]
         site_items = []
         for s in cur_sites:
             st_data = self.mon.calib_mgr.get_daily_calib(today_str, s) if hasattr(self.mon, "calib_mgr") else None
@@ -5314,9 +6568,20 @@ class App:
             else:
                 site_items.append("[● %s]" % s_short)
         site_str = "  ".join(site_items) if site_items else d["site"]
+        if len(cur_models) > 1:
+            site_str += "\n模型：" + "、".join(cur_models)
 
-        self.lbl_detail.config(text="缓存 %s / 未命中 %s ｜ %s 次调用\n%s%s" % (
-            fmt_vol(c_cr), fmt_vol(c_inp), d["calls"], site_str, (" " + cov if cov else "")))
+        # 「缓存明细缺失」的提示（2026-10-03）：补齐了几次 / 几次没数据可补
+        _fx = d.get("cache_fix") or {}
+        _fx_note = ""
+        if _fx.get("matched"):
+            _fx_note = " ｜ 明细补齐 %d 次" % _fx["matched"]
+        if _fx.get("missing"):
+            _fx_note += "（%d 次暂无数据）" % _fx["missing"]
+
+        self.lbl_detail.config(text="缓存 %s / 未命中 %s ｜ %s 次调用\n%s%s%s" % (
+            fmt_vol(c_cr), fmt_vol(c_inp), d["calls"], site_str,
+            (" " + cov if cov else ""), _fx_note))
 
         # 成本行
         priced = d.get("priced")
@@ -5333,11 +6598,18 @@ class App:
         else:
             base_cost = priced["cost"]
             ch_cost = ch.get("cost") or 0.0
-            hermes_total = base_cost + ch_cost
             cur = priced["cur"]
 
-            # 用户新规则：
-            # hermes检测数据 + 同步后补差价的数据（不再刷新，直到下次同步）= 最终价格 (已校准)
+            # 用户规则（2026-10-03 定稿）：
+            #   总价 = 主会话 Hermes 估算 + 补差
+            #   补差 = 站方总数 − 主会话 Hermes 估算
+            #   子代理【不进总价】：站方总数本身就含子代理的流水（子代理归在独立
+            #   名下但钱记在站方账上），所以补差里已经包含它。再把 ch_cost 加一遍
+            #   就是重复计算（实测多出 ¥0.0099 ≈ 子代理价格）。
+            #   子代理只在尾部显示一行 Hermes 侧参考值，不做任何加减。
+            hermes_total = base_cost
+            sub_total = base_cost + ch_cost   # 仅用于无站方数据时的兜底显示
+
             if offset and offset.get("has_calib"):
                 diff_cost = offset.get("diff_cost", 0.0)
                 final_cost = hermes_total + diff_cost
@@ -5347,11 +6619,13 @@ class App:
                 else:
                     cost_head = "≈ %s (已校准)" % fmt_money(final_cost, cur)
             else:
+                # 无站方数据：只能靠 Hermes 自己，此时子代理要算进去
+                hermes_total = sub_total
                 cost_head = "≈ %s" % fmt_money(hermes_total, cur)
 
             tail = ""
             if ch.get("count"):
-                tail = " ｜ 子%d %s" % (ch["count"], fmt_money(ch["cost"], ch["cur"]))
+                tail = " ｜ 子%d %s（参考·不计入）" % (ch["count"], fmt_money(ch["cost"], ch["cur"]))
                 if ch.get("unpriced"):
                     tail += "（%d 未配价）" % ch["unpriced"]
             gp = ""

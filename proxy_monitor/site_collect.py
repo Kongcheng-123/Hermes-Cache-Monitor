@@ -9,7 +9,7 @@
 
 用法:
   python site_collect.py                 # 采集全部启用站点
-  python site_collect.py --site d1api.xin
+  python site_collect.py --site example.com
   python site_collect.py --full          # 忽略水位，全量重拉
   python site_collect.py --stats         # 只看库内统计，不联网
   python site_collect.py --list          # 列出站点配置
@@ -36,7 +36,7 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 # ⚠️ quota → 金额 的换算系数
 #    · 用户口径（2026-10-01 明确）：两站均 1 美元 = 1 人民币，所以最终金额直接由
 #      quota ÷ quota_per_cny 得到「元」，不再二次乘汇率。
-#    · NewAPI 的 quota_per_unit 由站方配置（d1api.xin 的 /api/status 公开为 500000），
+#    · NewAPI 的 quota_per_unit 由站方配置（example.com 的 /api/status 公开为 500000），
 #      但每个站可不同 → 在 sites.json 里按站配置 quota_per_cny。
 #    · 换站/调口径只需改 sites.json，不改代码。
 QUOTA_PER_CNY_DEFAULT = 500000.0
@@ -238,7 +238,7 @@ def resolve_all_keys(site, provs):
 def http_get(url, headers, timeout=45, retries=3):
     """带重试的 GET。
 
-    ⚠️ 实测：d1api.xin 的 TLS 握手偶发超时（同一个请求可能 3s 成功、也可能 90s 超时），
+    ⚠️ 实测：example.com 的 TLS 握手偶发超时（同一个请求可能 3s 成功、也可能 90s 超时），
     属于网络层抖动而非接口问题 —— 必须重试 + 阶梯超时，否则采集器会随机失败。
     """
     h = {"User-Agent": UA, "Accept": "application/json"}

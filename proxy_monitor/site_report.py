@@ -406,7 +406,7 @@ def html_report(path, days=None):
         saved = 0.0
         if brow and brow[2] and brow[1] is not None:
             # 有效输入单价（从 quota 反推太绕），用站方倍率：cache 价 = 输入价 × cache_ratio
-            # d1api: model_ratio=0.03, cache_ratio=0.02 → 省 98% 的输入价
+            # 示例站: model_ratio=0.03, cache_ratio=0.02 → 省 98% 的输入价
             pass
         now[site] = {
             "n": (row[0] if row else 0) or 0,

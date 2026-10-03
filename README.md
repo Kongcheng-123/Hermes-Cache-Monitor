@@ -1,7 +1,8 @@
 # Hermes Cache Monitor (缓存跟随监控)
 
+**当前版本：v1.1.0** ｜ [更新日志](CHANGELOG.md)
+
 专为 **Hermes Agent (CN 桌面版)** 打造的极简、轻量、高颜值桌面 HUD 缓存跟随与第三方中转站实际扣费对账系统。
-描述是ai写的（
 ---
 
 ## ✨ 核心特性
@@ -90,7 +91,20 @@ pyinstaller build/HermesCacheMonitor.spec --distpath dist --workpath build/work 
 生成的单文件可执行程序将位于 `dist/HermesCacheMonitor.exe`。
 
 ---
-## ⭐本项目由api.dshapi.icu站赞助。满血国模0.092x，gpt不降智0.22x。有开源项目就赞助token
+
+## 📝 更新日志
+
+各版本的详细变更见 [CHANGELOG.md](CHANGELOG.md)。
+
+---
+
+## ⭐ 赞助
+
+本项目由 [api.dshapi.icu](https://api.dshapi.icu) 站赞助。
+满血国模 0.092x，gpt 不降智 0.22x。有开源项目就赞助 token。
+
+---
+
 ## 📄 开源协议
 
 本项目采用 [MIT License](LICENSE) 协议开源。

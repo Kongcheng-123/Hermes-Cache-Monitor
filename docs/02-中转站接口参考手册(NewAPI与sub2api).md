@@ -1,6 +1,6 @@
 # 接口参考（一手实测）
 
-## NewAPI（d1api.xin 类）
+## NewAPI（example.com 类）
 
 ```
 GET {base}/api/log/token     Header: Authorization: Bearer sk-xxx
@@ -21,11 +21,11 @@ token_name / model_name / quota / prompt_tokens / completion_tokens / use_time`
 ### 限流
 
 官方默认 `CriticalRateLimit` = 20 次 / 20 分钟 / 按 IP。
-d1api.xin 实测未开启，但别的站可能开着 → 采集间隔保守（默认 5 分钟）。
+example.com 实测未开启，但别的站可能开着 → 采集间隔保守（默认 5 分钟）。
 
 ### TLS 抖动
 
-`d1api.xin` 的 TLS 握手偶发超时（同一请求可能 3s 成功、也可能 90s 超时）。
+`example.com` 的 TLS 握手偶发超时（同一请求可能 3s 成功、也可能 90s 超时）。
 `http_get()` 已做阶梯超时 + 3 次重试，**别去掉**。
 
 ### 排查/验算脚本（已归档到 `archive/探索与排查/`）

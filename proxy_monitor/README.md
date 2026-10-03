@@ -1,7 +1,7 @@
 # 中转站侧用量监控 · 说明文档
 
 > 建立：2026-10-01　|　状态：**双站打通，与站方网页对账误差 1.7%**
-> 详细交接：`D:\Hermes works\handoffs\中转站用量监控：站方数据采集与对账.md`
+> 详细交接：`<项目目录>\handoffs\中转站用量监控：站方数据采集与对账.md`
 > 网页用法：`网页使用说明.md`
 
 ---
@@ -26,7 +26,7 @@
 ## 二、快速上手
 
 ```powershell
-cd "D:\Hermes works\proxy_monitor"
+cd "<项目目录>\proxy_monitor"
 
 # 采一轮
 python site_collect.py
@@ -44,7 +44,7 @@ python site_report.py
 python session_join.py
 
 # 查站点有哪些 key
-python find_keys.py d1api.xin
+python find_keys.py example.com
 ```
 
 **无第三方依赖**，标准库即可。
@@ -53,7 +53,7 @@ python find_keys.py d1api.xin
 
 ## 三、已打通的接口（一手实测）
 
-### NewAPI（d1api.xin）—— 逐条流水
+### NewAPI（example.com）—— 逐条流水
 
 ```
 GET {base}/api/log/token
@@ -66,7 +66,7 @@ Header: Authorization: Bearer sk-xxxxx
 - 恒返回「最近约 1000 条」（源码 `MaxRecentItems=1000`，无分页）
 - **必须靠高频轮询 + `request_id` 去重累积**，不能翻页取历史
 - 官方默认限流 `CriticalRateLimit` = 20 次/20 分钟/按 IP
-  （d1api.xin 实测**未开启**，连打 50+ 次 0 拦截；但按开启来设计）
+  （example.com 实测**未开启**，连打 50+ 次 0 拦截；但按开启来设计）
 
 返回字段关键部分：
 ```json
@@ -77,7 +77,7 @@ Header: Authorization: Bearer sk-xxxxx
   "quota": 97,                    // 扣费额度
   "prompt_tokens": 61536,         // ⚠ 含缓存
   "completion_tokens": 71,
-  "token_name": "ds2", "group": "svip",
+  "token_name": "key1", "group": "svip",
   "other": {                      // JSON 字符串，需二次解析
     "cache_tokens": 101248,       // ⭐ 缓存命中
     "cache_ratio": 0.02,
@@ -149,8 +149,8 @@ python dsh_flows.py --stats  # 看库内
 **解法**：`sites.json` 里把账号下**全部 key** 都配上（`hermes_providers` + `extra_keys`）。
 用 `find_keys.py` 或站方网页「API 密钥」页核对。
 
-> d1api.xin 实测有 3 个 key：`ds2`(svip，Hermes 在用)、`vip`、`c003`。
-> 只配了 `ds2` 时差 11.6%；三个全配后差 1.7%（纯时间差）。
+> example.com 示例站通常配多个 key（本机按需添加）
+> 只配了 `key1` 时差 11.6%；三个全配后差 1.7%（纯时间差）。
 
 ### 1. 金额换算：`quota ÷ 500000 = 元`
 
@@ -180,12 +180,12 @@ out_tokens <= 10 AND cache_read = 0 AND total_prompt < 1500
 
 ### 3. TLS 握手偶发超时
 
-d1api.xin 会随机卡死（同一请求可能 3 秒成功、也可能 90 秒超时）。
+example.com 会随机卡死（同一请求可能 3 秒成功、也可能 90 秒超时）。
 `http_get()` 已做**阶梯超时 + 3 次重试**，别去掉。
 
 ### 4. Hermes 侧 `billing_base_url` 有别名
 
-同一 host 拆成 4 个 provider 别名（`custom:d1api-xin` / `-2` / `custom` / `auto`）
+同一 host 拆成 4 个 provider 别名（`custom:your-provider` / `-2` / `custom` / `auto`）
 + 2 种 URL 变体（尾斜杠）。**统计必须 `LIKE '%host%'`**，否则漏 31%。
 
 ### 5. Hermes 侧不是流水，是快照
@@ -280,7 +280,7 @@ Python 服务不热加载。旧进程会继续往库里写旧口径的数据（�
 ### 加了站怎么生效
 
 ```bash
-cd "D:/Hermes works/proxy_monitor"
+cd "<项目目录>/proxy_monitor"
 python site_collect.py --list      # 看类型判得对不对
 python site_collect.py             # 采一轮
 ```
@@ -304,7 +304,7 @@ python site_collect.py             # 采一轮
 余额不同  → 不同账号 → 作为独立站加进来
 ```
 
-⚠️ **失效 key 要清掉**：实测 `custom:api-dshapi-icu-3` 长期返回
+⚠️ **失效 key 要清掉**：实测某个失效的 provider 别名长期返回
 `401 INVALID_API_KEY`，但因为旧版采集器静默吞错误，一直没被发现。
 新版会报「不完整：N/M key 失败」，看到就把失效 key 从 `hermes_providers` 删掉。
 
@@ -384,15 +384,15 @@ python site_health.py
 | `poll_loop.py` | 采集守护（5 分钟一轮） |
 | `panel.py` | Web 面板（127.0.0.1:8788） |
 
-自启挂在计划任务 `HermesDesktopAutoStart` → `D:\Hermes works\hermes_autostart.ps1`。
+自启挂在计划任务 `HermesDesktopAutoStart` → `<项目目录>\hermes_autostart.ps1`。
 **幂等**：已在跑则跳过，不会重复堆进程。想手动验证：跑一遍那个 ps1，应输出
 `proxy-monitor: already running (2 proc)`。
 
 ⚠️ **该 ps1 必须存成 UTF-8 with BOM** —— PowerShell 5.1 默认按 GBK 读 .ps1，
-无 BOM 时中文路径（`D:\Hermes works\...`）会被读坏，`Test-Path` 误判 not found。
+无 BOM 时中文路径（`<项目目录>\...`）会被读坏，`Test-Path` 误判 not found。
 （2026-10-01 踩过这个坑）
 
-**监控站点（2 个）**：`d1api.xin`（NewAPI）、`api.dshapi.icu`（sub2api，请求走 api2 副域名）
+**监控站点（2 个）**：`example.com`（NewAPI）、`api.dshapi.icu`（sub2api，请求走 api2 副域名）
 
 **体检**：
 

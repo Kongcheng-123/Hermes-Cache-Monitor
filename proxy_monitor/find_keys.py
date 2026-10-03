@@ -62,7 +62,7 @@ def fetch(root, key, path):
 
 
 def main():
-    host = sys.argv[1] if len(sys.argv) > 1 else "d1api.xin"
+    host = sys.argv[1] if len(sys.argv) > 1 else "example.com"
     provs = providers()
     root = "https://" + host
 
