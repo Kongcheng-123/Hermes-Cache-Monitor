@@ -136,29 +136,16 @@ def export_calibration(days_limit=7, verbose=False):
                 "last_ts": r["last_ts"] or 0,
             }
 
-        # 2.5 关联子会话：如果子代理会话有站方用量，合并归入父会话（支持悬浮窗父子统一对账）
-        hermes_db = r"D:\Hermes Agent CN Desktop\data\hermes-home\state.db"
-        if os.path.isfile(hermes_db):
-            try:
-                hcon = sqlite3.connect("file:%s?mode=ro" % hermes_db.replace("\\", "/"), uri=True)
-                child_rows = hcon.execute("SELECT id, parent_session_id FROM sessions WHERE parent_session_id IS NOT NULL").fetchall()
-                hcon.close()
-                for cid, pid in child_rows:
-                    if cid in sessions and pid:
-                        c_data = sessions[cid]
-                        p_data = sessions.setdefault(pid, {
-                            "calls": 0, "in_tokens": 0, "cache_read": 0, "out_tokens": 0,
-                            "cost": 0.0, "sites": [], "last_ts": 0,
-                        })
-                        p_data["calls"] += c_data["calls"]
-                        p_data["in_tokens"] += c_data["in_tokens"]
-                        p_data["cache_read"] += c_data["cache_read"]
-                        p_data["out_tokens"] += c_data["out_tokens"]
-                        p_data["cost"] = round(p_data["cost"] + c_data["cost"], 6)
-                        p_data["sites"] = sorted(list(set(p_data["sites"] + c_data["sites"])))
-                        p_data["last_ts"] = max(p_data["last_ts"], c_data["last_ts"])
-            except Exception:
-                pass
+        # ⚠️ 2026-10-04 移除：原来这里会把子会话的站方用量并入父会话
+        #    （旧口径「支持悬浮窗父子统一对账」）。
+        #    但站方面板的「按对话」统计是【每个会话独立】—— 子代理单独成行，
+        #    不并进父会话。两边口径不一致会导致：
+        #      校准值 = 父 + Σ子  >  面板值 = 父
+        #      → 悬浮窗补差偏高，正好高出一个子代理的金额（实测差 ¥0.016916，
+        #        等于两个子代理之和）。
+        #    现行用户口径（2026-10-04 定）：子代理【只展示、不计入总价】，
+        #    所以校准文件必须与面板同口径 → 不再合并子会话。
+        #    详见 handoffs\缓存监控：账目口径修复与v1.1.0发版.md
 
         # 3. 日度级汇总（按 day + 规范化 host + model 归集）
         q_daily = """

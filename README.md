@@ -1,6 +1,6 @@
 # Hermes Cache Monitor (缓存跟随监控)
 
-**当前版本：v1.1.0** ｜ [更新日志](CHANGELOG.md)
+**当前版本：v1.2.0** ｜ [更新日志](CHANGELOG.md)
 
 专为 **Hermes Agent (CN 桌面版)** 打造的极简、轻量、高颜值桌面 HUD 缓存跟随与第三方中转站实际扣费对账系统。
 ---
@@ -28,8 +28,11 @@
 ## 🚀 快速上手
 
 ### 方式 A：直接运行打包版（开箱即用，推荐）
-1. 前往 GitHub **Releases** 页面下载最新发布的 `HermesCacheMonitor_v5_Release.zip`；
-2. 解压到任意目录，直接双击运行 `HermesCacheMonitor.exe` 即可（无需安装 Python 环境）。
+1. 前往 GitHub **Releases** 页面下载最新发布的 `HermesCacheMonitor.exe`；
+2. 放到任意目录，直接双击运行即可（无需安装 Python 环境）。
+
+> 单文件 exe，站方采集模块已内置。首次启动会在同级目录自动准备 `proxy_monitor/`，
+> 拷到哪都能跑。
 
 ### 方式 B：源码运行（适合开发者）
 环境需求：Windows 10 / 11，Python 3.10+
@@ -85,10 +88,23 @@ pythonw cache_follow.py
 ## 🛠️ 自行打包 EXE
 
 本仓库已内置 PyInstaller 打包规范：
+
 ```bash
-pyinstaller build/HermesCacheMonitor.spec --distpath dist --workpath build/work --noconfirm
+# 1. 装依赖（pystray / Pillow 必须有，否则托盘功能会静默失效）
+pip install uiautomation comtypes pystray Pillow pyinstaller
+
+# 2. 在项目根目录执行
+py -m PyInstaller "build/HermesCacheMonitor.spec" ^
+   --distpath "dist" --workpath "build/work" --noconfirm
 ```
-生成的单文件可执行程序将位于 `dist/HermesCacheMonitor.exe`。
+
+生成的单文件可执行程序位于 `dist/HermesCacheMonitor.exe`（约 37 MB）。
+
+spec 会自动完成：
+
+- **依赖强校验** —— 缺 `pystray` / `Pillow` / `uiautomation` / `comtypes` 直接报错退出
+- **把 `proxy_monitor/` 一起打进 exe** —— 站方采集功能（校准 / 网页看板）依赖它在磁盘上可 import
+- **剔除运行时数据** —— 数据库、日志、个人配置（`store.db`、`poll.log`、`sites.json` 等）不会进包
 
 ---
 

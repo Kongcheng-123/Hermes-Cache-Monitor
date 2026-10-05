@@ -23,8 +23,12 @@ host_alias.json
 # 打包构建产物
 build/work/
 build/HermesCacheMonitor/
-dist/
 *.spec.bak
+
+# dist 里的 exe 走 GitHub Release 附件，不进仓库；
+# 但保留说明文件（要让 git 能走进 dist/，必须先放行目录本身）
+dist/*
+!dist/README.md
 
 # 编辑器与系统配置
 .vscode/

@@ -107,7 +107,7 @@ def apply_dark_title_bar(win, bg_hex="#1e1e24"):
 
 
 APP_NAME = "HermesCacheMonitor"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 
 # 数据目录分裂检测结果（由 _appdata_dir() 填充）：非空 = 发现 MSIX 虚拟化影子目录
 _DATA_SPLIT = ""
@@ -386,8 +386,58 @@ def init_paths(cfg=None):
     CALIB_PATH = os.path.join(dd, "proxy_calibration.json")
     SITE_MERGE_PATH = os.path.join(dd, "site_merge.json")
 
-    # 老版本把数据放在 <项目目录> → 平滑迁移一次
-    legacy = r"<项目目录>"
+    # 冻结版（PyInstaller）自愈：exe 同级的 proxy_monitor 缺失时补一份。
+    # ⚠ 不补的话：_get_proxy_monitor_dir() 返回不存在的路径 → import session_join 失败 →
+    #   「校准」报 No module named 'session_join'，「打开网页看板」子进程也拉不起来
+    #   （2026-10-05 实测定位，见 handoffs）
+    # ⚠ 但「直接释放」有坑：真正的流水库在主工作区 proxy_monitor\store.db，
+    #   盲目释放会造出一个空库副本，校准读到它算出来全是 0。
+    #   → 策略：先复用本机已有的真实 proxy_monitor（按库大小挑最全的），
+    #     实在没有才从 exe 内释放一份。
+    if getattr(sys, "frozen", False):
+        try:
+            _exe_dir = os.path.dirname(sys.executable)
+            _pm_target = os.path.join(_exe_dir, "proxy_monitor")
+
+            def _pm_score(p):
+                """候选目录打分：能 import session_join 才有意义，流水多少决定优先级。"""
+                if not os.path.isfile(os.path.join(p, "session_join.py")):
+                    return -1
+                db = os.path.join(p, "store.db")
+                try:
+                    return os.path.getsize(db)
+                except OSError:
+                    return 0
+
+            if not os.path.isfile(os.path.join(_pm_target, "session_join.py")):
+                _cands = []
+                # ① 打包内置（保底：模块代码一定是新的）
+                _meipass = getattr(sys, "_MEIPASS", "") or ""
+                if _meipass:
+                    _cands.append(os.path.join(_meipass, "proxy_monitor"))
+                # ② ★真实工作区（有流水库，优先复用）
+                _ws = os.environ.get("HERMES_CACHE_PM_DIR", "") or r"<项目目录>\proxy_monitor"
+                _cands.append(_ws)
+                # ③ 上游 release 布局
+                _cands.append(os.path.join(_exe_dir, "HermesCacheMonitor_v5_Release", "proxy_monitor"))
+
+                _real = [c for c in _cands[1:] if _pm_score(c) > 0]
+                _seed = max(_real, key=_pm_score) if _real else None
+                if _seed:
+                    _startup_log("proxy_monitor：复用 %s（store.db %d 字节）" % (_seed, _pm_score(_seed)))
+                else:
+                    _seed = next((c for c in _cands if _pm_score(c) >= 0), None)
+                    if _seed:
+                        shutil.copytree(_seed, _pm_target)
+                        _startup_log("已释放 proxy_monitor 到 %s（源 %s，无现成流水库）" % (_pm_target, _seed))
+        except Exception as _ex_pm:
+            _startup_log("准备 proxy_monitor 失败：%s" % _ex_pm)
+
+    # 老版本把数据放在工作区根目录 → 平滑迁移一次
+    #   （2026-10-04 改造：路径改从环境变量 HERMES_CACHE_LEGACY_DIR 读。）
+    #   本机数据早已迁完（工作区根目录下这三个文件都不存在了），
+    #   所以这段对你来说已是空转；保留是为了老用户升级时能自动搬家。
+    legacy = os.environ.get("HERMES_CACHE_LEGACY_DIR", "")
     if os.path.isdir(legacy) and os.path.abspath(legacy) != os.path.abspath(dd):
         for name in ("cache_prices.json", "cost_ledger.json", "calib_samples.json"):
             src = os.path.join(legacy, name)
@@ -975,20 +1025,41 @@ _SITE_MERGE_CACHE = None    # 归并配置缓存（站点表 + 模型表一起�
 _SITE_MERGE_MTIME = 0.0
 
 
+def _self_dir():
+    """本程序所在目录（打包后是 exe 目录，否则是脚本目录）。"""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
 def _get_proxy_monitor_dir():
-    """动态自适应解析 proxy_monitor 目录（支持分发与便携运行）。"""
+    """动态自适应解析 proxy_monitor 目录（支持分发与便携运行）。
+
+    候选顺序（2026-10-05 起，按数据价值排）：
+      ① 环境变量 HERMES_CACHE_PM_DIR（显式指定，留给分发给朋友时用）
+      ② 本机真实工作区 proxy_monitor（有流水库，优先复用）
+      ③ exe/脚本同级 proxy_monitor（自愈释放出来的那份）
+      ④ WORK_DIR / %APPDATA%\\HermesCacheMonitor 下的副本
+    ⚠ ②排③前面的原因：dist 下那份是 exe 自愈释放的，库是空的；
+      真实流水在主工作区，先用它校准才不会算出 0。
+    """
     cands = []
+    env_pm = os.environ.get("HERMES_CACHE_PM_DIR", "")
+    if env_pm:
+        cands.append(env_pm)
+    cands.append(r"<项目目录>\proxy_monitor")
     if getattr(sys, "frozen", False):
         exe_dir = os.path.dirname(sys.executable)
         cands.append(os.path.join(exe_dir, "proxy_monitor"))
     else:
-        cands.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "proxy_monitor"))
+        cands.append(os.path.join(_self_dir(), "proxy_monitor"))
     if "WORK_DIR" in globals() and WORK_DIR:
         cands.append(os.path.join(WORK_DIR, "proxy_monitor"))
     appdata = os.environ.get("APPDATA")
     if appdata:
         cands.append(os.path.join(appdata, "HermesCacheMonitor", "proxy_monitor"))
-    cands.append(r"<项目目录>\proxy_monitor")
+    # 兜底：脚本自身所在目录下的 proxy_monitor（分发/便携场景最可靠）
+    cands.append(os.path.join(_self_dir(), "proxy_monitor"))
     for p in cands:
         if p and os.path.isdir(p):
             return p
@@ -6625,7 +6696,8 @@ class App:
 
             tail = ""
             if ch.get("count"):
-                tail = " ｜ 子%d %s（参考·不计入）" % (ch["count"], fmt_money(ch["cost"], ch["cur"]))
+                tail = " ｜ %d 个子代理合计 %s（参考·不计入）" % (
+                    ch["count"], fmt_money(ch["cost"], ch["cur"]))
                 if ch.get("unpriced"):
                     tail += "（%d 未配价）" % ch["unpriced"]
             gp = ""
