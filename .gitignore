@@ -14,6 +14,9 @@ __pycache__/
 
 # 本地个人凭据与价格表（请使用 *.example.json 模板）
 sites.json
+credentials.json
+credential*.json
+dsh_auth.json
 proxy_calibration.json
 cache_prices.json
 cost_ledger.json

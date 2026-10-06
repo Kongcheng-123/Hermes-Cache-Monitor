@@ -57,7 +57,10 @@ NON_FLOW = ("(request_id NOT LIKE 'sub2api-model:%' "
             "                       AND x.day = usage_flows.day)))")
 
 _refresh_lock = threading.Lock()
-_last_refresh = {"at": 0, "msg": "", "running": False}
+_last_refresh = {"at": 0, "msg": "", "running": False, "level": "ok"}
+# level: ok=一切正常 / warn=有站采集不完整 / error=需要用户处理（如凭据失效）
+# 2026-10-06 新增：以前只有一句"新增 0 条"，看不出是"站方没新数据"还是
+# "我们登录态挂了" —— 用户因此被蒙了 3 天。现在分级 + 说人话。
 
 
 def q(con, sql, args=()):
@@ -78,6 +81,7 @@ def collect_now(target_sites=None):
         provs = site_collect.parse_hermes_providers()
         total_new = 0
         msgs = []
+        need_action = False      # ★ 2026-10-06：是否有需要用户处理的问题
         for s in sites:
             if not s.get("enabled", True):
                 continue
@@ -124,8 +128,15 @@ def collect_now(target_sites=None):
                         total_new += added2
                         msgs.append("dsh流水 +%d" % added2)
                         session_join.main_quiet()   # 新流水也归到对话
+                    else:
+                        msgs.append("dsh流水 无新数据")
+                else:
+                    # ★ 2026-10-06：拿不到 token = 逐条流水中断，必须让用户看见
+                    need_action = True
+                    msgs.append("⚠ dsh登录态失效，逐条流水已中断")
             except Exception as e:
-                msgs.append("dsh流水 失败:%s" % str(e)[:50])
+                need_action = True
+                msgs.append("⚠ dsh流水 失败:%s" % str(e)[:50])
         # 刷新完成后自动导出校准数据（供缓存监控使用）
         try:
             import calib_export
@@ -133,11 +144,22 @@ def collect_now(target_sites=None):
         except Exception:
             pass
         _last_refresh["at"] = int(time.time())
-        _last_refresh["msg"] = "新增 %d 条（%s）" % (total_new, "、".join(msgs))
-        return {"ok": True, "added": total_new, "detail": _last_refresh["msg"]}
+        # ★ 2026-10-06：分级 + 说人话。以前只有"新增 N 条"，看不出是不是我们挂了。
+        if need_action:
+            _last_refresh["level"] = "error"
+            _last_refresh["msg"] = "、".join(msgs)
+        elif total_new == 0:
+            _last_refresh["level"] = "warn"
+            _last_refresh["msg"] = "无新数据（%s）" % "、".join(msgs) if msgs else "无新数据"
+        else:
+            _last_refresh["level"] = "ok"
+            _last_refresh["msg"] = "新增 %d 条（%s）" % (total_new, "、".join(msgs))
+        return {"ok": True, "added": total_new, "detail": _last_refresh["msg"],
+                "level": _last_refresh["level"]}
     except Exception as e:
+        _last_refresh["level"] = "error"
         _last_refresh["msg"] = "失败: %s" % str(e)[:150]
-        return {"ok": False, "msg": _last_refresh["msg"]}
+        return {"ok": False, "msg": _last_refresh["msg"], "level": "error"}
     finally:
         _last_refresh["running"] = False
         _refresh_lock.release()
@@ -152,6 +174,12 @@ def build_state():
     out = {"now": datetime.now(CST).strftime("%Y-%m-%d %H:%M:%S"),
            "today": today, "sites": [], "sessions": [], "daily": [],
            "last_refresh": _last_refresh}
+    # ★ 2026-10-06：站点登录凭据状态（供顶部告警条用）
+    try:
+        import dsh_auth
+        out["creds"] = dsh_auth.cred_status()
+    except Exception as e:
+        out["creds"] = {"error": str(e)[:120]}
 
     for srow in q(con, """SELECT site, COUNT(*) n, MIN(day) d0, MAX(day) d1,
                                  SUM(cost) cost FROM usage_flows
@@ -257,6 +285,41 @@ class Handler(BaseHTTPRequestHandler):
                 }, ensure_ascii=False))
             except Exception as e:
                 self._send(500, json.dumps({"error": str(e)}, ensure_ascii=False))
+        elif self.path.startswith("/api/creds"):
+            # ★ 2026-10-06：站点登录态（自动识别 kind，列出全部站）
+            #   默认脱敏；?reveal=1 返回明文（供"小眼睛"，仅本机回环）
+            #   ?site=<host> 指定站点
+            try:
+                import importlib
+                import site_auth
+                importlib.reload(site_auth)
+                from urllib.parse import urlparse, parse_qs
+                qs = parse_qs(urlparse(self.path).query)
+                want_site = (qs.get("site") or [""])[0]
+                reveal = (qs.get("reveal") or [""])[0] == "1"
+
+                sites = site_auth.list_sites()
+                # 选中的站：显式指定 > 第一个「需要登录」的站 > 第一个站
+                target = None
+                if want_site:
+                    target = next((s for s in sites if s["host"] == want_site), None)
+                if target is None:
+                    target = next((s for s in sites if s.get("needs_login")), None)
+                if target is None and sites:
+                    target = sites[0]
+
+                out = {"sites": sites, "site": (target or {}).get("host", "")}
+                if target:
+                    out.update({k: v for k, v in target.items() if k != "host"})
+                if reveal and target and target.get("needs_login"):
+                    import dsh_auth
+                    importlib.reload(dsh_auth)
+                    email, pwd, _src = dsh_auth._cred_lookup(dsh_auth.load())
+                    out["email_plain"] = email or ""
+                    out["password_plain"] = pwd or ""
+                self._send(200, json.dumps(out, ensure_ascii=False))
+            except Exception as e:
+                self._send(500, json.dumps({"error": str(e)}, ensure_ascii=False))
         elif self.path in ("/", "/index.html"):
             self._send(200, PAGE, "text/html; charset=utf-8")
         else:
@@ -288,6 +351,53 @@ class Handler(BaseHTTPRequestHandler):
                     tag=body.get("tag") or "",
                     note=body.get("note") or "")
                 self._send(200, json.dumps({"ok": True, "row": row}, ensure_ascii=False))
+            except Exception as e:
+                self._send(500, json.dumps({"error": str(e)}, ensure_ascii=False))
+        elif self.path.startswith("/api/creds"):
+            # ★ 2026-10-06：录入/更新站点账号密码 → 按 kind 自动分派登录
+            try:
+                import importlib
+                import credentials
+                import site_auth
+                importlib.reload(credentials)
+                importlib.reload(site_auth)
+                act = body.get("action") or "save"
+                site = body.get("site") or ""
+                if not site:
+                    self._send(400, json.dumps({"error": "缺少 site"}, ensure_ascii=False))
+                    return
+                if act == "delete":
+                    ok = credentials.delete(site)
+                    self._send(200, json.dumps({"ok": ok}, ensure_ascii=False))
+                    return
+                email = (body.get("email") or "").strip()
+                pwd = body.get("password") or ""
+                if not email or not pwd:
+                    self._send(400, json.dumps({"error": "邮箱和密码都不能为空"}, ensure_ascii=False))
+                    return
+                # ★ 2026-10-07 修正：先校验站点是否支持/需要登录，通过了才写盘。
+                #   原实现是「先 save 再 login」，导致给无需登录的站（或错密码）
+                #   也会把无效凭据写进 credentials.json —— 实测已复现并清理。
+                site_cfg = site_auth.find_site(site)
+                if not site_cfg:
+                    self._send(200, json.dumps({
+                        "ok": False, "msg": "找不到站点 %s" % site,
+                    }, ensure_ascii=False))
+                    return
+                if not site_auth.needs_login(site_cfg):
+                    self._send(200, json.dumps({
+                        "ok": False,
+                        "msg": "该站不需要登录态（kind=%s，用 API key 采集），未写入凭据"
+                               % (site_cfg.get("kind") or "?"),
+                    }, ensure_ascii=False))
+                    return
+                # 校验凭据可用 → 成功才落盘
+                ok, msg, st = site_auth.login(site, email, pwd)
+                if ok:
+                    credentials.save(site, email, pwd)
+                self._send(200, json.dumps({
+                    "ok": ok, "msg": msg, "status": st,
+                }, ensure_ascii=False))
             except Exception as e:
                 self._send(500, json.dumps({"error": str(e)}, ensure_ascii=False))
         else:
@@ -353,6 +463,24 @@ tr.miss:hover{background:#332b1c}
 .pill.ok{background:#2e4a3a;color:#7ee09a}
 .pill.no{background:#4a3a1e;color:#e0b542}
 .sect{font-size:12px;color:var(--dim);margin:16px 0 6px}
+/* ★ 2026-10-06 凭据告警条 */
+.alert{display:none;align-items:center;gap:12px;margin:0 0 14px;padding:11px 15px;
+       border-radius:8px;font-size:13px;line-height:1.5}
+.alert.show{display:flex}
+.alert.err{background:#3a2222;border:1px solid #6a3838;color:#f0a8a8}
+.alert.warn{background:#3a3222;border:1px solid #6a5a38;color:#f0d0a0}
+.alert .atxt{flex:1}
+.alert b{color:#fff}
+.credbox{margin:14px 0;padding:13px 16px;background:#232329;border:1px solid var(--line);
+         border-radius:8px;font-size:12px;display:none}
+.credbox.show{display:block}
+.credbox h3{margin:0 0 10px;font-size:13px;color:var(--ylw)}
+.credbox input{background:#1b1b1f;border:1px solid var(--line);color:var(--fg);
+               border-radius:5px;padding:5px 8px;font-size:12px;font-family:inherit;
+               width:210px;margin-right:8px}
+.credbox input:focus{outline:none;border-color:var(--grn)}
+.credline{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:6px 0}
+.credhint{color:#6a6a72;font-size:11px;margin-top:8px;line-height:1.6}
 h2.sec{font-size:14px;color:var(--ylw);margin:20px 0 8px;font-weight:600;
     cursor:pointer;user-select:none;display:flex;align-items:center;gap:7px}
 h2.sec:hover{color:#f0d060}
@@ -367,12 +495,16 @@ h2.sec .cnt{font-size:11px;color:var(--dim);font-weight:400;margin-left:auto}
   <span class="msg" id="msg"></span>
 </div>
 <div class="sub" id="sub">加载中…</div>
+<div class="alert err" id="alert"><span class="atxt" id="alerttxt"></span>
+  <button class="btn" id="alertbtn" onclick="switchTab('site')">去站点账号页</button></div>
 <div class="tabs">
   <button class="tab on" id="tab-usage" onclick="switchTab('usage')">用量</button>
   <button class="tab" id="tab-price" onclick="switchTab('price')">模型定价</button>
+  <button class="tab" id="tab-site" onclick="switchTab('site')">站点账号</button>
 </div>
 <div id="root"></div>
 <div id="priceroot" style="display:none"></div>
+<div id="siteroot" style="display:none"></div>
 
 <script>
 const EX = __EX__;
@@ -384,8 +516,12 @@ function render(st){
   if(st.error){ document.getElementById('sub').textContent = st.error; return; }
   const lr = st.last_refresh||{};
   const lrTxt = lr.at ? new Date(lr.at*1000).toLocaleTimeString('zh-CN') : '尚未手动刷新';
-  document.getElementById('sub').textContent =
-    `数据时间 ${st.now} ｜ 上次手动刷新 ${lrTxt} ｜ 自动采集每 5 分钟 ｜ 汇率按 ${EX} 折算`;
+  const lv = lr.level||'ok';
+  const lvTag = lv==='error' ? ' ｜ <span style="color:#e08a8a">⚠ ' : (lv==='warn' ? ' ｜ <span style="color:#e0b542">' : ' ｜ ');
+  const lvTxt = lr.msg ? (lvTag + esc(lr.msg) + '</span>') : '';
+  document.getElementById('sub').innerHTML =
+    `数据时间 ${st.now} ｜ 上次手动刷新 ${lrTxt} ｜ 自动采集每 5 分钟 ｜ 汇率按 ${EX} 折算${lvTxt}`;
+  renderCredAlert(st);
 
   let todayCards = '', totalCards = '';
   for(const s of st.sites){
@@ -485,12 +621,211 @@ async function tick(){
 let PRICE_DATA = null;
 
 function switchTab(which){
-  const isU = which === 'usage';
+  const isU = which === 'usage', isP = which === 'price', isS = which === 'site';
   document.getElementById('tab-usage').classList.toggle('on', isU);
-  document.getElementById('tab-price').classList.toggle('on', !isU);
+  document.getElementById('tab-price').classList.toggle('on', isP);
+  document.getElementById('tab-site').classList.toggle('on', isS);
   document.getElementById('root').style.display = isU ? '' : 'none';
-  document.getElementById('priceroot').style.display = isU ? 'none' : '';
-  if(!isU) loadPrices();
+  document.getElementById('priceroot').style.display = isP ? '' : 'none';
+  document.getElementById('siteroot').style.display = isS ? '' : 'none';
+  if(isP) loadPrices();
+  if(isS) loadSiteCreds();
+}
+
+/* ===== ★ 2026-10-06 站点账号页（常驻）===== */
+let SITE_CREDS = null;
+let SHOW_PWD = false;
+
+async function loadSiteCreds(){
+  const el = document.getElementById('siteroot');
+  el.innerHTML = '<div class="sect">加载中…</div>';
+  try{
+    const r = await fetch('/api/creds', {cache:'no-store'});
+    SITE_CREDS = await r.json();
+    renderSiteCreds();
+  }catch(e){
+    el.innerHTML = '<div class="sect" style="color:#e08a8a">读取失败：'+esc(String(e))+'</div>';
+  }
+}
+
+function renderSiteCreds(){
+  const data = SITE_CREDS || {};
+  const sites = data.sites || [];
+  const cur = data.site || '';
+  const el = document.getElementById('siteroot');
+
+  if(!sites.length){
+    el.innerHTML = '<h2 class="sec"><span class="arw">▼</span>站点登录凭据</h2>' +
+                   '<div class="sect">没有读到站点配置（sites.json 为空？）</div>';
+    return;
+  }
+
+  let blocks = '';
+  for(const s of sites){
+    const isCur = s.host === cur;
+    blocks += renderOneSite(s, isCur && data);
+  }
+  el.innerHTML = `
+    <h2 class="sec"><span class="arw">▼</span>站点登录凭据
+      <span class="tag">按站点类型自动识别</span></h2>
+    <div class="credhint" style="margin:0 0 12px">
+      需要登录态的站点（如 sub2api）才显示账号密码框；用 API key 采集的站点（如 NewAPI）无需填写。
+    </div>` + blocks;
+
+  if(SHOW_PWD) revealPwd();
+}
+
+function renderOneSite(s, data){
+  const need = !!s.needs_login;
+  const st = s.status || '';
+  let badge;
+  if(st === 'ok') badge = `<span class="pill ok">${esc(s.status_text)}</span>`;
+  else if(st === 'no_login_needed') badge = `<span class="pill ok">${esc(s.status_text)}</span>`;
+  else if(st === 'expired') badge = `<span class="pill no">${esc(s.status_text)}</span>`;
+  else if(st === 'unsupported' || st === 'not_managed') badge = `<span class="pill no">${esc(s.status_text)}</span>`;
+  else badge = `<span class="pill no">${esc(s.status_text || '未知')}</span>`;
+
+  const head = `<h3>${esc(s.host)}${s.label ? '　<span style="color:#8a8a92;font-weight:400">'+esc(s.label)+'</span>' : ''}
+      <span class="tag">${esc(s.kind)}</span> ${badge}
+      ${s.enabled ? '' : '<span class="pill no">已停用</span>'}</h3>`;
+
+  // ① 不需要登录态 → 只展示说明，不给输入框
+  if(!need){
+    return `<div class="credbox show" style="margin:10px 0">
+      ${head}
+      <div class="credhint" style="margin:0">
+        该站通过 API key 直接采集逐条流水，无需账号密码。若采集异常，看顶部告警或 poll.log。
+      </div>
+    </div>`;
+  }
+
+  // ② 需要登录态但不支持（newapi 等）→ 说明清楚，别给假输入框
+  if(st === 'unsupported' || st === 'not_managed'){
+    return `<div class="credbox show" style="margin:10px 0">
+      ${head}
+      <div class="credhint" style="margin:0;color:#e0b542">
+        ${esc(s.status_text)}<br>
+        如需支持，请告知开发补该 kind 的登录适配。
+      </div>
+    </div>`;
+  }
+
+  // ③ sub2api 等需登录 → 给完整表单
+  const auto = s.can_autorelogin
+    ? `<span class="pill ok">已存凭据 · 可自动重登</span>`
+    : `<span class="pill no">未存凭据 · 无法自动重登</span>`;
+  const src = s.cred_source ? `　来源：<code>${esc(s.cred_source)}</code>` : '';
+  const emailVal = SHOW_PWD ? esc(data.email_plain || '') : esc(s.email || '');
+  // 密码：显示态用明文；遮罩态若有已存凭据则用圆点占位（不泄露长度）
+  const pwdVal = SHOW_PWD ? esc(data.password_plain || '')
+                          : (s.can_autorelogin ? '••••••••••••' : '');
+
+  return `<div class="credbox show" style="margin:10px 0">
+    ${head}
+    <div class="credline" style="margin-top:8px">${auto}</div>
+    <div class="credline">
+      <span style="width:38px">邮箱</span>
+      <input id="ci_email" type="text" placeholder="账号邮箱" autocomplete="off" value="${emailVal}">
+    </div>
+    <div class="credline">
+      <span style="width:38px">密码</span>
+      <input id="ci_pwd" type="${SHOW_PWD?'text':'password'}" placeholder="密码"
+             autocomplete="new-password" style="width:210px" value="${pwdVal}"
+             data-saved="${s.can_autorelogin ? '1' : '0'}">
+      <button class="btn gray sm" id="eye" onclick="togglePwd()">${SHOW_PWD?'🙈 隐藏':'👁 显示'}</button>
+      <button class="btn" onclick="saveSiteCred()">保存</button>
+      <button class="btn gray" onclick="relogin()">重新登录</button>
+      <button class="btn red" onclick="delSiteCred()">清除凭据</button>
+    </div>
+    <div class="credhint" id="credhint">
+      上次成功登录：${esc(s.last_refresh || '—')}${src}<br>
+      保存后会立即用它登录验证。凭据存本机 <code>proxy_monitor/credentials.json</code>（已排除在开源同步外），不走外网。
+    </div>
+  </div>`;
+}
+
+async function revealPwd(){
+  try{
+    const r = await fetch('/api/creds?reveal=1', {cache:'no-store'});
+    const c = await r.json();
+    SITE_CREDS = Object.assign(SITE_CREDS||{}, c);
+    const f = document.getElementById('ci_pwd');
+    if(f && c.password_plain) f.value = c.password_plain;
+    const e = document.getElementById('ci_email');
+    if(e && c.email_plain) e.value = c.email_plain;
+  }catch(err){}
+}
+
+function togglePwd(){
+  SHOW_PWD = !SHOW_PWD;
+  const f = document.getElementById('ci_pwd');
+  if(!f) return;
+  if(SHOW_PWD){
+    revealPwd();
+    f.type = 'text';
+    document.getElementById('eye').textContent = '🙈 隐藏';
+  }else{
+    f.type = 'password';
+    if(f.dataset.saved) f.value = '••••••••••••';
+    document.getElementById('eye').textContent = '👁 显示';
+  }
+}
+
+async function saveSiteCred(){
+  const email = (document.getElementById('ci_email').value||'').trim();
+  let pwd = document.getElementById('ci_pwd').value || '';
+  const hint = document.getElementById('credhint');
+  const f = document.getElementById('ci_pwd');
+  // 用户没改密码（还是遮罩占位）→ 不覆盖已存密码
+  if(f.dataset.saved && /^[•*]+$/.test(pwd)){
+    hint.innerHTML = '<span style="color:#e0b542">密码未改动 —— 若要只更新邮箱，请先点「显示」再确认密码</span>';
+    return;
+  }
+  if(!email || !pwd){
+    hint.innerHTML = '<span style="color:#e08a8a">邮箱和密码都不能为空</span>'; return;
+  }
+  hint.textContent = '正在登录验证…';
+  try{
+    const r = await fetch('/api/creds', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({site: SITE_CREDS.site, email, password: pwd})
+    });
+    const j = await r.json();
+    if(j.error){ hint.innerHTML = '<span style="color:#e08a8a">'+esc(j.error)+'</span>'; return; }
+    hint.innerHTML = j.ok ? '<span style="color:#4ec26a">✓ '+esc(j.msg||'成功')+'</span>'
+                          : '<span style="color:#e0b542">'+esc(j.msg||'失败')+'</span>';
+    if(j.ok){ SHOW_PWD = false; setTimeout(()=>loadSiteCreds(), 800); }
+  }catch(e){
+    hint.innerHTML = '<span style="color:#e08a8a">请求失败：'+esc(String(e))+'</span>';
+  }
+}
+
+async function relogin(){
+  const hint = document.getElementById('credhint');
+  hint.textContent = '正在用已存凭据重新登录…';
+  try{
+    const r = await fetch('/api/refresh');
+    const j = await r.json();
+    hint.innerHTML = j.level==='error'
+      ? '<span style="color:#e08a8a">'+esc(j.detail||j.msg||'失败')+'</span>'
+      : '<span style="color:#4ec26a">✓ '+(j.detail||'已刷新')+'</span>';
+    setTimeout(()=>loadSiteCreds(), 900);
+  }catch(e){ hint.innerHTML = '<span style="color:#e08a8a">'+esc(String(e))+'</span>'; }
+}
+
+async function delSiteCred(){
+  if(!confirm('确定清除该站点的账号密码？清除后将无法自动重登。')) return;
+  const hint = document.getElementById('credhint');
+  try{
+    const r = await fetch('/api/creds', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({site: SITE_CREDS.site, action:'delete'})
+    });
+    const j = await r.json();
+    hint.innerHTML = j.ok ? '<span style="color:#4ec26a">✓ 已清除</span>'
+                          : '<span style="color:#e08a8a">清除失败</span>';
+    setTimeout(()=>loadSiteCreds(), 700);
+  }catch(e){ hint.innerHTML = '<span style="color:#e08a8a">'+esc(String(e))+'</span>'; }
 }
 
 async function loadPrices(){
@@ -648,14 +983,52 @@ async function addPrice(){
   }catch(e){ m.className='msg err'; m.textContent='加入失败: '+e; }
 }
 
+/* ===== ★ 2026-10-06 站点凭据：告警 + 录入 ===== */
+let CREDSITE = '';
+
+function renderCredAlert(st){
+  const c = st.creds || {};
+  const box = document.getElementById('alert');
+  const txt = document.getElementById('alerttxt');
+  const btn = document.getElementById('alertbtn');
+  CREDSITE = c.site || '';
+  if(c.error){ box.className='alert warn show'; txt.textContent='凭据状态读取失败：'+c.error;
+               btn.style.display='none'; return; }
+  if(c.token_ok){
+    box.className='alert';                    // 正常 → 整条隐藏
+    if(c.expires_in_h < 6){                   // 快过期给个提示（不算故障）
+      box.className='alert warn show';
+      txt.innerHTML = `站点 <b>${esc(c.site)}</b> 登录态将在 ${c.expires_in_h.toFixed(1)} 小时后过期` +
+                      (c.can_autorelogin ? '，届时会自动重登，无需操作。' : '，且未存账号密码，请提前录入。');
+      btn.style.display = c.can_autorelogin ? 'none' : '';
+    }
+    return;
+  }
+  // token 失效 → 红色告警
+  box.className='alert err show';
+  const ago = c.last_refresh ? `（上次成功：${esc(c.last_refresh)}）` : '';
+  txt.innerHTML = `⚠ 站点 <b>${esc(c.site)}</b> 登录态已失效${ago}，` +
+                  `<b>逐条流水采集中断</b> → 会话列表不会更新。` +
+                  (c.can_autorelogin ? '已存凭据，点刷新可自动重登；仍失败则去「站点账号」页更新。'
+                                     : '请到「站点账号」页录入账号密码。');
+  btn.style.display='';
+  btn.textContent = '去站点账号页';
+  btn.onclick = ()=>{ switchTab('site'); };
+}
+
 async function doRefresh(){
   const b = document.getElementById('rf'), m = document.getElementById('msg');
   b.disabled = true; b.classList.add('spin'); m.className='msg'; m.textContent='正在采集…';
   try{
     const r = await fetch('/api/refresh');
     const d = await r.json();
-    m.className = d.ok ? 'msg' : 'msg err';
-    m.textContent = d.ok ? ('✓ ' + (d.detail||'完成')) : ('✗ ' + (d.msg||'失败'));
+    const lv = d.level || (d.ok ? 'ok' : 'error');
+    m.className = lv==='error' ? 'msg err' : (lv==='warn' ? 'msg' : 'msg');
+    if(lv==='error') m.style.color = '#e08a8a';
+    else if(lv==='warn') m.style.color = '#e0b542';
+    else m.style.color = '';
+    const head = lv==='error' ? '⚠ ' : (lv==='warn' ? '· ' : '✓ ');
+    m.textContent = head + (d.detail || d.msg || '完成');
     await tick();
   }catch(e){ m.className='msg err'; m.textContent='✗ '+e; }
   b.disabled = false; b.classList.remove('spin');

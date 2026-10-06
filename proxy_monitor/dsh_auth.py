@@ -205,6 +205,61 @@ def login(email, password, log=print, save_password=False):
     return store
 
 
+def _cred_lookup(store):
+    """取该站凭据：优先 credentials.json（独立凭据文件），回退 dsh_auth.json。
+
+    2026-10-06 改造（用户拍板方案 B）：密码从 dsh_auth.json 挪到
+    credentials.json，这样 sites.json / dsh_auth.json 都可以分享/同步而不漏密码。
+    """
+    site = _site_host()
+    try:
+        import credentials as _c
+        c = _c.get(site)
+        if c.get("email") and c.get("password"):
+            return c["email"], c["password"], "credentials.json"
+    except Exception:
+        pass
+    # 回退：老位置（兼容未迁移的情况）
+    if store.get("email") and store.get("password"):
+        return store["email"], store["password"], "dsh_auth.json"
+    return None, None, None
+
+
+def _site_host():
+    """本 token 对应的站点 host（从 sites.json 的 session_auth 站读）。"""
+    try:
+        from . import site_resolver as _sr
+    except ImportError:
+        try:
+            import site_resolver as _sr
+        except Exception:
+            return "api.dshapi.icu"
+    try:
+        s = _sr.default_sub2api_site()
+        return _sr.host_of(s) or "api.dshapi.icu"
+    except Exception:
+        return "api.dshapi.icu"
+
+
+def cred_status():
+    """给界面看的凭据状态（脱敏，不含明文密码）。"""
+    store = load()
+    email, pwd, src = _cred_lookup(store)
+    site = _site_host()
+    left = (store.get("expires_at") or 0) - time.time()
+    return {
+        "site": site,
+        "token_ok": bool(store.get("access_token")) and left > 0,
+        "expires_in_h": round(left / 3600.0, 2),
+        "has_refresh": bool(store.get("refresh_token")),
+        "can_autorelogin": bool(email and pwd),
+        "cred_source": src or "无",
+        "email": (email[:2] + "***" + email[email.find("@"):]) if email and "@" in email else (email or ""),
+        "last_refresh": time.strftime("%Y-%m-%d %H:%M:%S",
+                                      time.localtime(store.get("refreshed_at") or 0)),
+    }
+
+
 def ensure_token(log=print):
     """拿可用的 access_token。三级降级：
 
@@ -212,6 +267,8 @@ def ensure_token(log=print):
       ② 到期了 → 用 refresh_token 续（同家族轮转）
       ③ 续不动了 → 有邮箱密码就**重新登录**（新建家族，浏览器不受影响）
     返回 None = 彻底拿不到，调用方应提示用户补一次凭据（别静默）。
+
+    凭据来源（2026-10-06）：credentials.json 优先，dsh_auth.json 回退。
     """
     store = load()
     if store.get("access_token") and not expiring(store):
@@ -223,9 +280,10 @@ def ensure_token(log=print):
         if new and new.get("access_token"):
             return new["access_token"]
 
-    if store.get("email") and store.get("password"):
+    email, pwd, _src = _cred_lookup(store)
+    if email and pwd:
         log("  续期失败，改用账号密码重新登录（会新建独立家族）…")
-        new = login(store["email"], store["password"], log=log)
+        new = login(email, pwd, log=log)
         if new and new.get("access_token"):
             return new["access_token"]
 
