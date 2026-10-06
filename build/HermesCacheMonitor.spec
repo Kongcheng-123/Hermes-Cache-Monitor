@@ -61,6 +61,8 @@ _PACK_EXCLUDE_FILES = {
     'last_retention.txt', 'sites.json', 'host_alias.json',
     'cache_prices.json', 'cost_ledger.json', 'calib_samples.json',
     'site_merge.json', 'prices.json',
+    # 站点登录凭据（含明文账号密码）——绝不进分发包
+    'credentials.json', 'credentials.json.tmp',
 }
 
 
