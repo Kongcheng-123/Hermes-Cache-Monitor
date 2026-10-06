@@ -107,7 +107,7 @@ def apply_dark_title_bar(win, bg_hex="#1e1e24"):
 
 
 APP_NAME = "HermesCacheMonitor"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.2.1"
 
 # 数据目录分裂检测结果（由 _appdata_dir() 填充）：非空 = 发现 MSIX 虚拟化影子目录
 _DATA_SPLIT = ""
@@ -7024,6 +7024,88 @@ def _force_utf8_output():
             pass
 
 
+_SINGLE_INSTANCE_MUTEX = None
+
+
+def _acquire_single_instance():
+    """单实例保护（仅 GUI 模式调用）。
+
+    为什么需要（2026-10-06 事故）：
+        程序没有单实例锁 → 每被启动一次就多一个进程，且点 ✕ 只是隐藏到托盘
+        （不退出），于是进程会无限累积。实测被反复启动后攒到 43 个进程、
+        每个约 115MB，把系统内存吃光。
+    行为：
+        已有实例在跑 → 把那个窗口唤到前台，然后本进程直接退出。
+    返回：
+        True = 本进程是唯一实例，继续跑；False = 已有实例，本进程应退出。
+    """
+    global _SINGLE_INSTANCE_MUTEX
+
+    if os.name != "nt":
+        return True
+
+    try:
+        import ctypes
+        from ctypes import wintypes
+        ERROR_ALREADY_EXISTS = 183
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+        # Local\ 前缀 = 当前登录会话内唯一（同一用户多开会被拦住；
+        # 用 Global\ 会跨会话，远程/多用户场景下反而不合适）
+        name = "Local\\HermesCacheMonitor_SingleInstance_v1"
+        handle = kernel32.CreateMutexW(None, False, name)
+        last_err = ctypes.get_last_error()
+
+        if not handle:
+            # 拿不到互斥体（极少见）→ 不拦，按老行为继续
+            _startup_log("单实例：CreateMutex 失败（err=%d），跳过检查" % last_err)
+            return True
+
+        _SINGLE_INSTANCE_MUTEX = handle       # 保持引用，进程活着期间不能释放
+
+        if last_err == ERROR_ALREADY_EXISTS:
+            _startup_log("单实例：已有实例在运行，唤醒它后退出")
+            _wake_existing_window()
+            return False
+        return True
+    except Exception as ex:
+        _startup_log("单实例：检查异常 %s（按无障碍处理）" % ex)
+        return True
+
+
+def _wake_existing_window():
+    """把已在运行的悬浮窗唤到前台（找不到就算了，不报错）。"""
+    try:
+        import ctypes
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+
+        # 主窗口标题形如「缓存跟随监控 v1.2.0」，按前缀模糊找
+        found = []
+
+        @ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+        def _cb(hwnd, _lparam):
+            try:
+                buf = ctypes.create_unicode_buffer(512)
+                user32.GetWindowTextW(hwnd, buf, 512)
+                t = buf.value or ""
+                if t.startswith("缓存跟随监控"):
+                    found.append(hwnd)
+            except Exception:
+                pass
+            return True
+
+        user32.EnumWindows(_cb, 0)
+        if not found:
+            return
+
+        hwnd = found[0]
+        SW_RESTORE = 9
+        user32.ShowWindow(hwnd, SW_RESTORE)     # 从托盘/最小化恢复
+        user32.SetForegroundWindow(hwnd)
+    except Exception:
+        pass
+
+
 def main():
     _force_utf8_output()
     args = sys.argv
@@ -7097,6 +7179,10 @@ def main():
             d = m.current(include_gap=False)
         _dump(m, d)
         raise SystemExit(0)
+    # ③ GUI 模式：单实例保护（headless 命令行不拦，否则 --stats 等会被挡住）
+    if not _acquire_single_instance():
+        return
+
     App().run()
 
 
