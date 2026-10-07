@@ -289,6 +289,7 @@ class Handler(BaseHTTPRequestHandler):
             # ★ 2026-10-06：站点登录态（自动识别 kind，列出全部站）
             #   默认脱敏；?reveal=1 返回明文（供"小眼睛"，仅本机回环）
             #   ?site=<host> 指定站点
+            #   ?relogin=1  → 只重登拿 token（轻量，1-2 秒；不走全量采集）
             try:
                 import importlib
                 import site_auth
@@ -297,9 +298,9 @@ class Handler(BaseHTTPRequestHandler):
                 qs = parse_qs(urlparse(self.path).query)
                 want_site = (qs.get("site") or [""])[0]
                 reveal = (qs.get("reveal") or [""])[0] == "1"
+                want_relogin = (qs.get("relogin") or [""])[0] == "1"
 
                 sites = site_auth.list_sites()
-                # 选中的站：显式指定 > 第一个「需要登录」的站 > 第一个站
                 target = None
                 if want_site:
                     target = next((s for s in sites if s["host"] == want_site), None)
@@ -307,6 +308,25 @@ class Handler(BaseHTTPRequestHandler):
                     target = next((s for s in sites if s.get("needs_login")), None)
                 if target is None and sites:
                     target = sites[0]
+
+                # ★ 2026-10-07：专用重登路径 —— 只拿 token，不做全量采集。
+                #   原来前端「重新登录」按钮走 /api/refresh（全量采集 30 秒），
+                #   30 秒静默期会让用户以为失败。这里拆开。
+                if want_relogin and target and target.get("needs_login"):
+                    import credentials
+                    importlib.reload(credentials)
+                    c = credentials.get(target["host"])
+                    if not (c.get("email") and c.get("password")):
+                        self._send(200, json.dumps({
+                            "ok": False, "action": "relogin",
+                            "msg": "没有已存凭据，请先填写账号密码",
+                        }, ensure_ascii=False))
+                        return
+                    ok, msg, st = site_auth.login(target["host"], c["email"], c["password"])
+                    self._send(200, json.dumps({
+                        "ok": ok, "action": "relogin", "msg": msg, "status": st,
+                    }, ensure_ascii=False))
+                    return
 
                 out = {"sites": sites, "site": (target or {}).get("host", "")}
                 if target:
@@ -802,15 +822,18 @@ async function saveSiteCred(){
 
 async function relogin(){
   const hint = document.getElementById('credhint');
-  hint.textContent = '正在用已存凭据重新登录…';
+  const site = (SITE_CREDS && SITE_CREDS.site) || '';
+  hint.textContent = '正在重新登录（只换 token，不做全量采集）…';
   try{
-    const r = await fetch('/api/refresh');
+    // ★ 2026-10-07：改走专用重登入口（1-2 秒），不再用 /api/refresh（全量采集 30 秒）
+    const r = await fetch('/api/creds?relogin=1&site=' + encodeURIComponent(site), {cache:'no-store'});
     const j = await r.json();
-    hint.innerHTML = j.level==='error'
-      ? '<span style="color:#e08a8a">'+esc(j.detail||j.msg||'失败')+'</span>'
-      : '<span style="color:#4ec26a">✓ '+(j.detail||'已刷新')+'</span>';
-    setTimeout(()=>loadSiteCreds(), 900);
-  }catch(e){ hint.innerHTML = '<span style="color:#e08a8a">'+esc(String(e))+'</span>'; }
+    if(j.error){ hint.innerHTML = '<span style="color:#e08a8a">'+esc(j.error)+'</span>'; return; }
+    hint.innerHTML = j.ok
+      ? '<span style="color:#4ec26a">✓ '+esc(j.msg||'重登成功')+'</span>'
+      : '<span style="color:#e0b542">'+esc(j.msg||'重登失败')+'</span>';
+    setTimeout(()=>loadSiteCreds(), 700);
+  }catch(e){ hint.innerHTML = '<span style="color:#e08a8a">请求失败：'+esc(String(e))+'</span>'; }
 }
 
 async function delSiteCred(){
