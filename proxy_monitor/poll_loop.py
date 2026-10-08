@@ -117,46 +117,107 @@ def one_round():
     sites = site_collect.load_sites()
     provs = site_collect.parse_hermes_providers()
     total_new = 0
+    # ★ 2026-10-08：两轮采集（用户拍板）。
+    #   第一轮各站并行、每站 30 秒；失败的站记下来，末尾串行兜底再试一轮。
+    #   两轮都失败 = 如实报失败，不再无限重试。
+    failed = []
     for s in sites:
         if not s.get("enabled", True):
             continue
         try:
-            r = site_collect.run_site(s, provs, full=False, log=lambda m: None)
+            r = site_collect.run_site(s, provs, full=False, log=lambda m: None, budget=30)
             if r:
                 total_new += r.get("added") or 0
                 log("%-20s 拉到 %-5d 新增 %-5d" % (
                     r["site"], r["fetched"], r["added"]))
+            else:
+                failed.append(s)
         except Exception as e:
             log("%-20s 采集异常 %s: %s" % (s.get("host"), type(e).__name__, str(e)[:150]))
+            failed.append(s)
 
-    # ── dshapi 逐条流水（走网页端 JWT，见 dsh_flows.py）──
-    # 该站的 sk- key 接口只有聚合数据（一天一行），无法归集到对话；
-    # 逐条流水必须走 /api/v1/usage（需登录态），所以这里补采一次。
-    # ⚠️ 不做这步 → 面板「按对话」看不到 dsh 的数据（只有点「立即刷新」才会有）
+    # ── 第二轮：兜底重试失败的站（串行，各再给 30 秒）──
+    for s in failed:
+        h = s.get("host") or "?"
+        try:
+            r = site_collect.run_site(s, provs, full=False, log=lambda m: None, budget=30)
+            if r:
+                total_new += r.get("added") or 0
+                log("%-20s 拉到 %-5d 新增 %-5d（重试成功）" % (
+                    r["site"], r["fetched"], r["added"]))
+            else:
+                log("%-20s 采集失败（两轮均失败，本轮放弃）" % h)
+        except Exception as e:
+            log("%-20s 采集失败（两轮均失败）：%s" % (h, str(e)[:100]))
+
+    # ── sub2api 站逐条流水（走网页端 JWT，见 dsh_flows.py）──
+    # 这类站的 sk- key 接口只有聚合数据（一天一行），无法归集到对话；
+    # 逐条流水必须走 /api/v1/usage（需登录态），所以这里补采。
+    # ⚠️ 不做这步 → 面板「按对话」看不到 sub2api 站的数据（只有点「立即刷新」才会有）
+    #
+    # ★ 2026-10-07 多站改造：原来这里**写死只采一个站**（dshapi），
+    #   第二个 sub2api 站（如 tryaigc）的流水永远采不到、token 也永不续期。
+    #   现在遍历 sites.json 里所有 kind=sub2api 且需要登录态的站，各用各的 token。
     try:
         import importlib
         import dsh_auth
         import dsh_flows
         importlib.reload(dsh_auth)
         importlib.reload(dsh_flows)
-        tok = dsh_auth.ensure_token(log=lambda m: None)
-        if not tok:
-            log("dsh 逐条          跳过（拿不到登录态；跑 py dsh_auth.py --login 补，或 --import 从浏览器读）")
-            _alert_login_needed("ensure_token 返回空：本地 token 已过期且续期/重登都失败")
-        else:
-            items, _t = dsh_flows.fetch_items(tok, pages=3, log=lambda m: None)
-            if items:
-                norms = [dsh_flows.norm(it) for it in items if it.get("request_id")]
-                con = site_collect.db()
-                added = site_collect.upsert(con, norms)
-                con.commit()
-                con.close()
-                total_new += added
-                log("dsh 逐条流水       拉到 %-5d 新增 %-5d" % (len(norms), added))
-            else:
-                log("dsh 逐条流水       窗口内无新记录")
+
+        # 找出所有需要登录态的 sub2api 站
+        s2sites = []
+        for s in sites:
+            if not s.get("enabled", True):
+                continue
+            if (s.get("kind") or "").lower() != "sub2api":
+                continue
+            host = s.get("host") or ""
+            # 需不需要登录态：显式 session_auth 优先，否则 kind 默认（sub2api=需要）
+            need = s.get("session_auth")
+            if need is None:
+                need = True
+            if need and host:
+                s2sites.append(s)
+
+        for s in s2sites:
+            host = s.get("host") or ""
+            try:
+                tok = dsh_auth.ensure_token(log=lambda m: None, host=host)
+                if not tok:
+                    log("%-18s 逐条跳过（无登录态；去站点账号页填账号密码）" % host)
+                    _alert_login_needed("%s 拿不到登录态（token 失效且无法自动重登）" % host)
+                    continue
+                # ★ 2026-10-08 修（域名泄漏）：每个站用自己的请求域名池。
+                #   原来直接读 s.get("bases")，站上没配就空 → base=None →
+                #   dsh_flows.pick_base() 兜底到模块级 BASES（= 第一个 sub2api 站）
+                #   → 静默把别的站的数据采回来贴本站标签。
+                #   改用 site_resolver.bases_of()：没配 bases 时回退 base_url 的 origin。
+                try:
+                    import site_resolver as _srp
+                    bases = _srp.bases_of(s)
+                except Exception:
+                    bases = []
+                base = bases[0] if bases else None
+                if not base:
+                    log("%-18s 逐条跳过（缺请求域名：bases/base_url 都没配）" % host)
+                    continue
+                items, _t = dsh_flows.fetch_items(tok, pages=3, log=lambda m: None, base=base)
+                if items:
+                    norms = [dsh_flows.norm(it, host=host)
+                             for it in items if it.get("request_id")]
+                    con = site_collect.db()
+                    added = site_collect.upsert(con, norms)
+                    con.commit()
+                    con.close()
+                    total_new += added
+                    log("%-18s 逐条拉到 %-5d 新增 %-5d" % (host, len(norms), added))
+                else:
+                    log("%-18s 逐条窗口内无新记录" % host)
+            except Exception as e:
+                log("%-18s 逐条异常 %s: %s" % (host, type(e).__name__, str(e)[:120]))
     except Exception as e:
-        log("dsh 逐条异常 %s: %s" % (type(e).__name__, str(e)[:150]))
+        log("逐条流水异常 %s: %s" % (type(e).__name__, str(e)[:150]))
 
     # ── 每次采集后都跑一次会话归集与校准导出（确保无论是否有新流水，最新对话都能关联并导出）──
     try:

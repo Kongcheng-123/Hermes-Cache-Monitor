@@ -103,19 +103,76 @@ def is_free(host, model):
                        (not e.get("in") and not e.get("out") and not e.get("cache"))))
 
 
-def compute_cost(host, model, in_tokens, cache_tokens, out_tokens):
-    """按单价算钱（元）。无价返回 None（调用方据此显示「未配价」）。"""
+def is_per_call(host, model):
+    """★ 2026-10-08：该「站×模型」是否按次收费。
+
+    按次收费的语义（用户拍板）：
+      · 不看 token，每次调用固定收 per_call 元
+      · 缓存/未命中的 token 明细照常**显示**，但不参与计价
+      · 缓存省为 0（按次收费时缓存命中不省钱）
+    返回 per_call 的数值（>0 才算），否则 None。
+    """
+    e = find(host, model)
+    return _safe_per_call(e)
+
+
+def _safe_per_call(e):
+    """从价格条目取 per_call 数值；脏值/缺失/非正数一律 None（= 非按次）。
+
+    单点收口：所有读 per_call 的地方都走这里，避免某处漏 try/except
+    （历史教训：covered_models 里一行内联 float() 就让整页 500）。
+    """
+    if not e:
+        return None
+    try:
+        v = float(e.get("per_call") or 0)
+    except (TypeError, ValueError):
+        return None
+    return v if v > 0 else None
+
+
+def compute_cost(host, model, in_tokens, cache_tokens, out_tokens, calls=None):
+    """算钱（元）。无价返回 None（调用方据此显示「未配价」）。
+
+    ★ 2026-10-08 支持按次收费：
+        配置里写了 per_call（每次 X 元）→ 成本 = 调用次数 × X，
+        token 明细仍会显示但**不参与计价**（用户明确：纯按次，不看 token）。
+        calls 没传时按次模式返回 None（无法计算，调用方应显示「需次数」）。
+      没写 per_call → 维持原来的按 token 计价，行为完全不变。
+    """
+    # ★ 显式免费优先，但**仅限 tag='免费'**。
+    #   ⚠ 不能直接用 is_free()：它的既有口径是「三价全 0 也算免费」，而按次
+    #   条目的 token 单价本来就是 0 → 会被误判成免费、金额恒为 0。
+    _e = find(host, model)
+    if _e and _e.get("tag") == "免费":
+        return 0.0
+    pc = is_per_call(host, model)
+    if pc is not None:
+        if calls is None:
+            return None
+        # ⚠ calls 校验：负数→负成本、非数字→抛异常打断调用方。脏值当算不了。
+        try:
+            n = int(calls)
+        except (TypeError, ValueError):
+            return None
+        if n < 0:
+            return None
+        return n * pc
     p = unit_price(host, model)
     if p is None:
         return None
-    pi, po, pc = p
+    pi, po, pcc = p
     return ((in_tokens or 0) * pi + (out_tokens or 0) * po +
-            (cache_tokens or 0) * pc) / 1e6
+            (cache_tokens or 0) * pcc) / 1e6
 
 
 def upsert(host, model, in_price, out_price, cache_price, cur="¥",
-           tag="", note=""):
-    """新增或更新一条价格（原子写）"""
+           tag="", note="", per_call=None):
+    """新增或更新一条价格（原子写）
+
+    ★ 2026-10-08：per_call = 每次收费（元）。留空/0 = 按 token 计价（原行为）。
+      按次收费时 in/out/cache 应留 0（或留空），避免两个口径混算。
+    """
     entries = _load_raw()
 
     def num(v):
@@ -136,6 +193,10 @@ def upsert(host, model, in_price, out_price, cache_price, cur="¥",
     for k in ("in", "out", "cache"):
         if row[k] is None:
             row[k] = 0.0
+    # ★ 按次收费：>0 才写字段（0/空 = 不写，保持配置干净、向后兼容）
+    _pc = num(per_call)
+    if _pc is not None and _pc > 0:
+        row["per_call"] = _pc
     if tag:
         row["tag"] = tag
     if note:
@@ -145,7 +206,29 @@ def upsert(host, model, in_price, out_price, cache_price, cur="¥",
     for i, e in enumerate(entries):
         if _norm(e.get("host")) == _norm(row["host"]) and \
            _norm(e.get("model")) == _norm(row["model"]):
-            entries[i] = row
+            # ★ 2026-10-08 修**字段保留**：原来是 entries[i] = row 整条替换，
+            #   凡是本次没传的字段（per_call / tag / note / ratio / periods…）
+            #   全被抹掉。前端两张表能力不同（covered 表没有备注框、也没有
+            #   ratio/峰谷），用哪张表保存都会把另一张表特有的配置清空。
+            #   实测：先存 per_call=0.08 + tag=免费，再存一次别的就把这两个
+            #   字段整条抹掉，按次配置静默消失、退回 token（而 token 单价是 0
+            #   → 成本永远算 0）。
+            #   现在改成：以旧条目为底，只覆盖本次显式给出的字段。
+            merged = dict(e)
+            for k, v in row.items():
+                if v is None and k in ("in", "out", "cache"):
+                    merged[k] = 0.0          # 三价显式归零
+                else:
+                    merged[k] = v
+            # 显式清空：本次传了空 tag/note/per_call(=0) 时，要真的清掉。
+            # 用 None 作哨兵区分「没传」与「传了空」。
+            if per_call is not None and (num(per_call) or 0) <= 0:
+                merged.pop("per_call", None)
+            if tag is not None and not str(tag).strip():
+                merged.pop("tag", None)
+            if note is not None and not str(note).strip():
+                merged.pop("note", None)
+            entries[i] = merged
             hit = True
             break
     if not hit:
@@ -209,8 +292,14 @@ def covered_models(sites=None):
             "in": i or 0, "cache": cr or 0, "out": o or 0,
             "site_cost": cost or 0,                 # 站方给的实际花费
             "priced": e is not None,
+            # ★ 2026-10-08：按次收费标记（前端据此显示「¥0.08/次」而不是单价）
+            # ⚠ 必须 try/except：这行没有保护时，一条脏 per_call（如手改文件写成
+            #   "abc"）会让 covered_models 抛 ValueError → /api/prices 500 →
+            #   整个「模型定价」页读不出来。脏值一律当「非按次」。
+            "per_call": _safe_per_call(e),
             "price": ({"in": e.get("in"), "out": e.get("out"),
                        "cache": e.get("cache"), "cur": e.get("cur", "¥"),
+                       "per_call": e.get("per_call"),
                        "tag": e.get("tag", "")} if e else None),
             "matched": (("%s/%s" % (e.get("host"), e.get("model"))) if e else ""),
         })

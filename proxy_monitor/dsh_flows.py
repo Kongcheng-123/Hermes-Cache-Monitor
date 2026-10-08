@@ -73,15 +73,33 @@ def pick_base(log=None):
     return BASES[0]
 
 
-def fetch_items(tok, pages=MAX_PAGES, log=print, base=None):
-    """按页拉逐条流水，按 request_id 去重"""
-    base = base or pick_base(log)
+def fetch_items(tok, pages=MAX_PAGES, log=print, base=None, proxy=None):
+    """按页拉逐条流水，按 request_id 去重
+
+    ★ 2026-10-08 修（域名泄漏）：**base 必须由调用方传入本站的域名**，
+      不再 `base or pick_base()` 兜底。原因：pick_base() 读的是模块级
+      BASES（= sites.json 里第一个 sub2api 站），任何漏传 base 的调用都会
+      静默打到那个站上，把它的数据贴到本站标签（实测 tryaigc 434 条全串）。
+      宁可报错，也不串数据。
+
+    ★ 2026-10-08 加 proxy（按站代理）：部分站直连不通必须挂梯子。
+      proxy 为空/None = 直连（向后兼容）。传 "host" 时不传 proxy 的话，
+      会自动按 host 从 sites.json 反查该站的代理配置。
+    """
+    if not base:
+        raise ValueError(
+            "fetch_items 缺少 base（本站请求域名）。"
+            "调用方应先用 site_resolver.bases_of(site) 取该站域名再传入；"
+            "绝不兜底到别的站。")
+    if proxy is None:
+        proxy = dsh_auth._site_proxy(dsh_auth._site_from_base(base))
     out = {}
     total = None
     for p in range(1, pages + 1):
         url = "%s%s?page=%d&page_size=%d" % (base, API, p, PAGE_SIZE)
         st, body = sc.http_get(url, {"Authorization": "Bearer " + tok,
-                                     "User-Agent": sc.UA}, timeout=45, retries=3)
+                                     "User-Agent": sc.UA}, timeout=45, retries=3,
+                                    proxy=proxy)
         if st != 200:
             log("    第%d页 HTTP %s：%s" % (p, st, (body or "")[:120]))
             break
@@ -111,8 +129,12 @@ def fetch_items(tok, pages=MAX_PAGES, log=print, base=None):
     return list(out.values()), total
 
 
-def norm(it, host="api.dshapi.icu"):
+def norm(it, host):
     """逐条 → 统一 schema（与 site_collect 的 upsert 兼容）
+
+    ★ 2026-10-08：host 改为**必填**（原来默认 "api.dshapi.icu"）。
+      默认值等于"忘传就写 dshapi"，与域名泄漏同性质 —— 忘传时数据会
+      挂到错误的站名下。要求调用方显式给出本站身份。
 
     ⚠️ 时区关键（2026-10-01 踩坑）：
       站方 created_at 带 +08:00 偏移，fromisoformat().timestamp() 得到的是
@@ -185,26 +207,33 @@ def main():
     print("dshapi 逐条流水采集  %s" % datetime.now(CST).strftime("%Y-%m-%d %H:%M:%S"))
     print("=" * 70)
 
-    tok = dsh_auth.ensure_token(log=lambda m: print(m))
+    tok = dsh_auth.ensure_token(log=lambda m: print(m), host=SITE)
     if not tok:
         print("✗ 拿不到登录态。请先跑： python dsh_auth.py --import")
         return
-    if not dsh_auth.verify(tok):
+    # ★ 2026-10-08 修（域名泄漏）：命令行入口也要显式带本站域名与身份。
+    #   以前 fetch_items / norm 都靠默认值（= dshapi），跑到别的站就是串数据。
+    _base = (BASES or [None])[0]
+    if not _base:
+        print("✗ 站点 %s 没配请求域名（sites.json 的 bases/base_url），无法采集" % SITE)
+        return
+    print("  站点身份 %s，请求域名 %s" % (SITE, _base))
+    if not dsh_auth.verify(tok, base=_base):
         print("✗ token 已失效，尝试续期…")
-        s = dsh_auth.refresh()
-        if not s or not dsh_auth.verify(s["access_token"]):
+        s = dsh_auth.refresh(log=print, host=SITE, base=_base)
+        if not s or not dsh_auth.verify(s["access_token"], base=_base):
             print("✗ 续期后仍不可用。需重新 --import")
             return
         tok = s["access_token"]
 
     t0 = time.time()
-    items, total = fetch_items(tok, pages=a.pages)
+    items, total = fetch_items(tok, pages=a.pages, base=_base)
     print("  合计拉到 %d 条（站方 total=%s）" % (len(items), total))
     if not items:
         print("  （无新数据）")
         return
 
-    norms = [norm(it) for it in items if it.get("request_id")]
+    norms = [norm(it, host=SITE) for it in items if it.get("request_id")]
     con = sc.db()
     added = sc.upsert(con, norms)
     con.commit()

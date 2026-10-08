@@ -19,6 +19,7 @@ import json
 import os
 import re
 import sqlite3
+import threading
 import sys
 import time
 import urllib.error
@@ -235,19 +236,85 @@ def resolve_all_keys(site, provs):
 
 # ───────────────────────── HTTP ─────────────────────────
 
-def http_get(url, headers, timeout=45, retries=3):
+# ★ 2026-10-07 每站采集预算（线程隔离）
+#   背景：http_get 的重试阶梯（timeout + attempt*30）对「偶发 TLS 抖动」有效，
+#   但站彻底连不上时最坏要 45+75+105 = 225 秒才放弃。串行采多个站时能拖十几分钟，
+#   用户看到的就是「点刷新一直卡住」（实测 example.com 卡 9 分钟）。
+#
+#   ⚠️ 用 threading.local 而不是模块级 dict：
+#   改成并行采集后多个站同时在采，共享一份全局 deadline 会互相覆盖
+#   （A 站设 90s，B 站设完就把 A 的预算改了）→ 必须按线程隔离。
+_TL = threading.local()
+
+
+def set_site_budget(seconds):
+    """开始采一个站前调用：给它 seconds 秒的总预算（0/None = 不限）
+
+    线程安全：每个线程各自记自己的预算。
+    """
+    _TL.deadline_at = time.time() if seconds else 0
+    _TL.budget = seconds or 0
+
+
+def _budget_left():
+    """本线程当前站的剩余预算秒数；没设预算返回 None"""
+    b = getattr(_TL, "budget", 0)
+    if not b:
+        return None
+    return b - (time.time() - getattr(_TL, "deadline_at", time.time()))
+
+def http_get(url, headers, timeout=45, retries=3, deadline=None, proxy=None):
     """带重试的 GET。
 
     ⚠️ 实测：example.com 的 TLS 握手偶发超时（同一个请求可能 3s 成功、也可能 90s 超时），
     属于网络层抖动而非接口问题 —— 必须重试 + 阶梯超时，否则采集器会随机失败。
+
+    ★ 2026-10-07 加 deadline（总耗时上限，秒）：
+      重试的阶梯超时（timeout + attempt*30）对「偶发抖动」很有效，但对
+      「站彻底连不上」代价极大 —— 3 次重试最长 45+75+105 = 225 秒（近 4 分钟），
+      串行采多个站时能拖到十几分钟，用户看到的就是「点刷新一直卡住」（实测踩过）。
+      传 deadline 后：每次请求的超时会被压到「剩余预算」以内，预算用完立刻返回失败，
+      不再无谓等待。默认 None = 保持原行为（命令行单站采集等场景不受影响）。
+
+    ★ 2026-10-08 加 proxy（按站代理，站点账号页可配）：
+      部分站直连不通、必须走梯子（实测 example.com 直连 15s 超时，走
+      127.0.0.1:4512 后 2s 就 200）。代理**按站**给，不全局 ——
+      直连本来很快的站（0.6s）绕代理反而变慢。
+      proxy 为空/None = 直连（保持原行为，向后兼容）。
+      格式：http://127.0.0.1:4512
     """
     h = {"User-Agent": UA, "Accept": "application/json"}
     h.update(headers)
     last = None
+    t_start = time.time()
+    # ★ 没显式传 deadline 时，自动遵守「每站预算」（见 _SITE_DEADLINE）
+    if deadline is None:
+        deadline = _budget_left()
+    # ★ 代理：只在有值时建 opener，避免给直连请求引入无谓开销
+    opener = None
+    if proxy:
+        p = _norm_proxy(proxy)
+        if p:
+            opener = urllib.request.build_opener(
+                urllib.request.ProxyHandler({"http": p, "https": p}))
     for attempt in range(retries):
+        # ★ 2026-10-08：阶梯从 attempt*30 收到 attempt*10。
+        #   原阶梯（45/75/105）是为「90 秒预算 + 偶发 TLS 抖动」设计的，
+        #   预算收到 30 秒后，第一次尝试就可能吃掉全部预算 —— 一个坏站
+        #   要等 30 秒才轮到下一个。现在 10/20/30，配上 30 秒预算，
+        #   单站最坏 30 秒、正常站 1-2 秒就回。
+        want = timeout + attempt * 10
+        if deadline:
+            left = deadline - (time.time() - t_start)
+            if left <= 1:
+                break                       # 预算用尽，别再等了
+            want = min(want, int(left))
         try:
-            r = urllib.request.urlopen(urllib.request.Request(url, headers=h),
-                                       timeout=timeout + attempt * 30)
+            req = urllib.request.Request(url, headers=h)
+            if opener is not None:
+                r = opener.open(req, timeout=want)
+            else:
+                r = urllib.request.urlopen(req, timeout=want)
             return r.status, r.read().decode("utf-8", "replace")
         except urllib.error.HTTPError as e:
             # HTTP 错误是明确的业务响应，不重试
@@ -255,8 +322,62 @@ def http_get(url, headers, timeout=45, retries=3):
         except Exception as e:
             last = e
             if attempt < retries - 1:
-                time.sleep(1.5 * (attempt + 1))
+                if deadline and (time.time() - t_start) >= deadline - 1:
+                    break
+                time.sleep(1.0 * (attempt + 1))
+    if last is None:
+        return None, "超时预算耗尽（%ss）" % deadline
     return None, "%s: %s" % (type(last).__name__, str(last)[:160])
+
+
+def _norm_proxy(v):
+    """规范化代理地址。支持给裸端口（'4512' → 'http://127.0.0.1:4512'）。
+
+    返回 '' 表示不启用代理。
+    """
+    if not v:
+        return ""
+    s = str(v).strip()
+    if not s:
+        return ""
+    # 纯数字 = 端口，补全成本机回环
+    if s.isdigit():
+        return "http://127.0.0.1:" + s
+    if "://" not in s:
+        return "http://" + s
+    return s
+
+
+def site_proxy(site):
+    """取某站的代理地址（规范化后）。空 = 直连。
+
+    站点配置里的字段名兼容两种写法：proxy / proxy_url。
+    """
+    if not isinstance(site, dict):
+        return ""
+    return _norm_proxy(site.get("proxy") or site.get("proxy_url") or "")
+
+
+def check_proxy(proxy, timeout=6):
+    """探测代理是否可用（连得上且能出网）。
+
+    返回 (ok: bool, msg: str)。给「保存代理」时做即时反馈用 ——
+    代理写错不该等下一轮采集才暴露。
+    """
+    p = _norm_proxy(proxy)
+    if not p:
+        return True, "未启用代理（直连）"
+    try:
+        op = urllib.request.build_opener(
+            urllib.request.ProxyHandler({"http": p, "https": p}))
+        # 用一个轻量、稳定的目标验证能出网
+        r = op.open(urllib.request.Request("https://api.dshapi.icu/",
+                                           headers={"User-Agent": UA}), timeout=timeout)
+        if r.status < 500:
+            return True, "代理可用（HTTP %s）" % r.status
+        return True, "代理已连通（HTTP %s）" % r.status
+    except Exception as e:
+        return False, "代理不可用：%s" % str(e)[:120]
 
 
 # ───────────────────────── 存储 ─────────────────────────
@@ -417,7 +538,8 @@ def collect_newapi(site, key, since_ts=0, log=print):
     if base.endswith("/v1"):
         base = base[:-3]
     hdr = {"Authorization": "Bearer " + key}
-    st, body = http_get("%s/api/log/token?p=0&page_size=100" % base, hdr, timeout=60)
+    st, body = http_get("%s/api/log/token?p=0&page_size=100" % base, hdr, timeout=60,
+                        proxy=site_proxy(site))
     if st != 200:
         # ⚠️ 不能静默返回空（2026-10-02 修）—— 见 CollectError 注释
         raise CollectError("NewAPI /api/log/token HTTP %s：%s"
@@ -543,7 +665,7 @@ def collect_sub2api(site, key, since_ts=0, log=print):
         base = base[:-3]
     hdr = {"Authorization": "Bearer " + key}
 
-    st, body = http_get(base + "/v1/usage", hdr, timeout=45)
+    st, body = http_get(base + "/v1/usage", hdr, timeout=45, proxy=site_proxy(site))
     # ⚠️ 域名故障回退（2026-10-01）：主站曾整站 TLS 挂掉。
     #    sites.json 的 bases 是请求域名池，按顺序试，谁通用谁。
     #    base_url 已是首选域名，这里只补试池里其余的。
@@ -552,7 +674,7 @@ def collect_sub2api(site, key, since_ts=0, log=print):
             alt = (alt or "").rstrip("/")
             if not alt or alt == base:
                 continue
-            st2, body2 = http_get(alt + "/v1/usage", hdr, timeout=45)
+            st2, body2 = http_get(alt + "/v1/usage", hdr, timeout=45, proxy=site_proxy(site))
             if st2 == 200:
                 log("    首选域名不通（%s），回退 %s 成功" % (st, alt))
                 base, st, body = alt, st2, body2
@@ -571,7 +693,8 @@ def collect_sub2api(site, key, since_ts=0, log=print):
 
     # ★ 结算倍率（彩蛋接口）：标价 × rate = 实付。用于成本校准，免去手工价格表
     rate = 0.0
-    st2, b2 = http_get(base + "/v1/sub2api/billing", hdr, timeout=25, retries=2)
+    st2, b2 = http_get(base + "/v1/sub2api/billing", hdr, timeout=25, retries=2,
+                       proxy=site_proxy(site))
     if st2 == 200:
         try:
             rate = float(json.loads(b2).get("effective_rate_multiplier") or 0)
@@ -729,9 +852,15 @@ def upsert(con, norms):
     return n_after - n_before
 
 
-def run_site(site, provs, full=False, log=print):
+def run_site(site, provs, full=False, log=print, budget=None):
     host = site["host"]
     kind = site.get("kind", "newapi")
+    # ★ 2026-10-07：给这个站设总预算。
+    # ★ 2026-10-08：默认从 90 秒收到 **30 秒**（用户拍板）。
+    #   理由：站连不上时 90 秒太长，一次刷新被一两个坏站拖到几分钟。
+    #   现在 30 秒扫不到就跳过、先去采别的站，失败的站留到末尾兜底再试一轮
+    #   （见 panel.collect_now 的两轮调度）。仍失败就如实报失败。
+    set_site_budget(30 if budget is None else budget)
     log("─" * 70)
     log("站点 %s  [%s]  %s" % (host, kind, site.get("base_url", "")))
     if kind == "unknown":

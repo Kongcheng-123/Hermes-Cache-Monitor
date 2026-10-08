@@ -106,8 +106,633 @@ def apply_dark_title_bar(win, bg_hex="#1e1e24"):
         _startup_log("暗黑标题栏应用失败：%s" % e)
 
 
+# ─────────────── 无边框窗口增强（2026-10-09 界面优化） ───────────────
+#  用户拍板：去掉系统标题栏（省 32px 高度），最小化/退出移入右键菜单。
+#  实测（tmp/border_corner_probe*.py）：
+#    · DWM 圆角属性 33 在 Win11 上对 overrideredirect 窗口有效，
+#      且**自带一圈淡阴影**（老式 CS_DROPSHADOW 在半透明无边框窗口上无效）
+#    · 圆角是 Win11 专属，Win10 会静默失效退回直角（不影响功能）
+
+def apply_round_corners(win, level=2):
+    """给无边框窗口加 Windows 11 原生圆角（自带淡阴影）。
+
+    level: 2=ROUND（默认圆角）| 3=ROUNDSMALL（小圆角）。失败静默返回 False。
+    """
+    try:
+        import ctypes
+        win.update_idletasks()
+        hwnd = ctypes.windll.user32.GetParent(win.winfo_id())
+        if not hwnd:
+            hwnd = win.winfo_id()
+        pref = ctypes.c_int(int(level))
+        res = ctypes.windll.dwmapi.DwmSetWindowAttribute(
+            hwnd, 33, ctypes.byref(pref), ctypes.sizeof(pref))
+        return res == 0
+    except Exception as e:
+        _startup_log("系统圆角应用失败：%s" % e)
+        return False
+
+
+def force_dark_menus():
+    """把进程级菜单主题强制为深色。
+
+    ★ 2026-10-09 实测（tmp/dark_menu_probe5.py）：不开时原生菜单是纯白
+      (#f9f9f9)，调用 uxtheme 私有 ordinal 135(SetPreferredAppMode, ForceDark)
+      + 136(FlushMenuThemes) 后变成系统深灰 #2c2c2c。
+      这管的是 **原生 Win32 菜单**（pystray 托盘菜单就是它）——tk 菜单不吃这个，
+      tk 菜单靠 MENU_STYLE 直接指定颜色。
+      uxtheme 的这两个序号是未文档化 API，失败就静默跳过（不影响功能）。
+    """
+    try:
+        import ctypes
+        ux = ctypes.WinDLL("uxtheme")
+        for ordinal, args in ((135, (2,)), (136, ())):
+            try:
+                ux[ordinal](*args)
+            except Exception:
+                pass
+        return True
+    except Exception as e:
+        _startup_log("深色菜单注入失败（不影响功能）：%s" % e)
+        return False
+
+
+def make_menu(parent, **kw):
+    """统一风格的右键菜单（tk.Menu 不吃系统深色，必须显式上色）。"""
+    opts = dict(MENU_STYLE)
+    opts.update(kw)
+    try:
+        return tk.Menu(parent, tearoff=0, **opts)
+    except Exception:
+        # 极少数平台不支持部分选项 → 退回只用颜色
+        return tk.Menu(parent, tearoff=0, bg=MENU_BG, fg=MENU_FG)
+
+
+def bind_window_drag(win, widgets, skip=None, on_click=None, threshold=4,
+                     is_edge=None):
+    """给无边框窗口做拖动：按下 → 位移超过 threshold 像素才算拖，否则算点击。
+
+    ★ 2026-10-09 修正 1（用户实测：只有「有字的地方」能拖、空白处光标变了却拖不动）：
+      Tk 的 <B1-Motion> 是发给**鼠标指针当前所在的控件**，不是按下的那个控件。
+      所以只给一堆 Label 绑事件，指针一离开文字（落到窗口空白/Frames）就断掉，
+      表现成「只有文字上能拖」。→ 同时绑到顶层窗口上。
+    ★ 2026-10-09 修正 2（自测抓出）：连续 Motion 里不能再用 winfo_x() 当基准 ——
+      Tk 的 geometry 请求不是立即生效，winfo_x() 会返回旧值，导致快速拖动时
+      位移被累加成「25+50+80=155」（实测，拖得比手快）。改为自己维护位置。
+    ★ 2026-10-09 修正 3：按在窗口边缘时应交给 enable_border_resize 拉伸，
+      否则拖动与拉伸会同时改 geometry 打架（is_edge 回调用于判定）。
+    """
+    st = {"x": 0, "y": 0, "px": 0, "py": 0, "moved": False, "down": False}
+    skip_ids = {str(w) for w in (skip or ())}
+
+    def _press(ev):
+        if is_edge and is_edge(ev):
+            st["down"] = False          # 边缘 → 让拉伸逻辑接管
+            return
+        st["x"], st["y"] = ev.x_root, ev.y_root
+        st["px"], st["py"] = win.winfo_x(), win.winfo_y()
+        st["moved"], st["down"] = False, True
+
+    def _motion(ev):
+        if not st["down"]:
+            return
+        dx, dy = ev.x_root - st["x"], ev.y_root - st["y"]
+        if not st["moved"]:
+            if abs(dx) < threshold and abs(dy) < threshold:
+                return
+            st["moved"] = True
+        nx, ny = st["px"] + dx, st["py"] + dy
+        # 别把窗口整个拖到屏幕外（留一点可见，方便抓回来）
+        try:
+            sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+            ww, wh = win.winfo_width(), win.winfo_height()
+            nx = max(-ww + 60, min(nx, sw - 60))
+            ny = max(0, min(ny, sh - 40))
+        except Exception:
+            pass
+        win.geometry("+%d+%d" % (nx, ny))
+
+    def _release(ev):
+        was = st["down"] and not st["moved"]
+        st["down"] = False
+        if was and on_click:
+            try:
+                on_click(ev)
+            except Exception:
+                pass
+
+    targets = [win] + [w for w in widgets if w is not None and str(w) not in skip_ids]
+    for w in targets:
+        try:
+            w.bind("<Button-1>", _press, add="+")
+            w.bind("<B1-Motion>", _motion, add="+")
+            w.bind("<ButtonRelease-1>", _release, add="+")
+        except Exception:
+            pass
+
+
+# ─────────── 无边框窗口「四边拉伸」与「自绘深色菜单」（2026-10-09） ───────────
+#  用户反馈：① 去掉系统标题栏后四边不能拉伸了 ② tk 菜单四周有 2px 浅色白边
+#  实测（tmp/probe_menu_*.py）：那 2px 是 Tk 在 Windows 上给 menu 窗口画的
+#  原生外框（activeBorderWidth=0 / 改类画刷 / 去窗口样式 都无效），
+#  所以改用「自绘无边框菜单」（probe_selfmenu.py 验证四边 0 白边 + 可加圆角）。
+
+_RESIZE_EDGE = 6          # 边缘热区宽度（像素）
+
+
+def style_dark_tree(root):
+    """把 ttk 的 Treeview 变深色（子窗口表格统一用这个）。
+
+    ★ 2026-10-09：用户反馈「子窗口和主窗口 UI 对齐一下」——
+      实测根因：Treeview 走系统默认 ttk 主题（winnative/vista），是白底黑字的
+      浅色表格，跟主窗口的碳黑风格完全割裂。
+      做法：切到 clam 主题（只有它允许自由改色），再加一个 Dark.Treeview 样式。
+      实测表格区底色 #1e1e24、文字 #f4f4f6。
+    """
+    try:
+        st = ttk.Style(root)
+        try:
+            st.theme_use("clam")
+        except Exception:
+            pass
+        st.configure("Dark.Treeview",
+                     background="#1e1e24", foreground=FG,
+                     fieldbackground="#1e1e24",
+                     bordercolor="#2f2f38", borderwidth=0, rowheight=22)
+        st.configure("Dark.Treeview.Heading",
+                     background="#26262c", foreground=FG,
+                     relief="flat", borderwidth=0)
+        st.map("Dark.Treeview",
+               background=[("selected", MENU_ACTIVE_BG)],
+               foreground=[("selected", "#ffffff")])
+        st.map("Dark.Treeview.Heading", background=[("active", "#33333c")])
+    except Exception as e:
+        _startup_log("表格深色化失败：%s" % e)
+
+
+def style_child_window(win, round_corners=True, tree=False):
+    """统一子窗口外观：底色 / 沉浸式标题栏 / Win11 圆角 /（可选）深色表格。
+
+    ★ 2026-10-09 用户要求「子窗口和主窗口 UI 对齐，排版不用变」：
+      · 底色统一 BG、沉浸式深色标题栏（各子窗口原本就有）
+      · 补上 Win11 圆角 + 淡阴影 —— 主窗口已改无边框圆角，子窗口还停在直角
+      · 表格（Treeview）统一深色，避免白底表格最刺眼
+      注意：**不改任何排版/控件位置/尺寸**，只动外观属性。
+    """
+    try:
+        win.configure(bg=BG)
+    except Exception:
+        pass
+    try:
+        apply_dark_title_bar(win, bg_hex=BG)
+    except Exception:
+        pass
+    if round_corners:
+        try:
+            win.after(80, lambda: apply_round_corners(win, 2))
+        except Exception:
+            pass
+    # ★ 2026-10-09 修正（用户反馈「价格配置/提示注入的标题栏还是白色」）：
+    #   实测（tmp/probe_titlebar.py + probe_titlebar2.py）：建窗时立刻调
+    #   apply_dark_title_bar 有 3 个窗口不生效（价格配置/提示注入/实付录入，
+    #   标题栏实测 #f3f3f3 白色），而延迟重设（等窗口真正显示出来再设一次）
+    #   实测生效（→ #16161a）。
+    #   原因：DWM 的深色标题栏属性要在窗口被映射后才认，建窗那一刻设会被吞掉。
+    #   所以这里排一次延迟重设；顺带覆盖后续 resizable()/transient() 可能的重建。
+    for _delay in (120, 400):
+        try:
+            win.after(_delay, lambda w=win: apply_dark_title_bar(w, bg_hex=BG))
+        except Exception:
+            pass
+    if tree:
+        try:
+            style_dark_tree(win)
+        except Exception:
+            pass
+
+
+def enable_border_resize(win, min_w=240, min_h=80, edge=_RESIZE_EDGE):
+    """给无边框窗口恢复「四边/四角拖拽改大小」的能力。
+
+    返回给调用方的字典，附带 bind_tree() 用于把事件绑到所有子控件
+    （Tk 的 Motion 事件发给指针所在控件，不绑子控件就会出现"某些区域拉不动"）。
+    """
+    st = {"mode": None, "x": 0, "y": 0, "px": 0, "py": 0, "w": 0, "h": 0}
+    CURSORS = {
+        "n": "sb_v_double_arrow", "s": "sb_v_double_arrow",
+        "e": "sb_h_double_arrow", "w": "sb_h_double_arrow",
+        "ne": "size_ne_sw", "sw": "size_ne_sw",
+        "nw": "size_nw_se", "se": "size_nw_se",
+    }
+
+    def _which(ev):
+        try:
+            w = win.winfo_width()
+            h = win.winfo_height()
+        except Exception:
+            return None
+        x, y = ev.x, ev.y
+        e = edge
+        west, east = x <= e, x >= w - e
+        north, south = y <= e, y >= h - e
+        if north and west:
+            return "nw"
+        if north and east:
+            return "ne"
+        if south and west:
+            return "sw"
+        if south and east:
+            return "se"
+        if north:
+            return "n"
+        if south:
+            return "s"
+        if west:
+            return "w"
+        if east:
+            return "e"
+        return None
+
+    def _press(ev):
+        m = _which(ev)
+        st["mode"] = m
+        if not m:
+            return
+        st["x"], st["y"] = ev.x_root, ev.y_root
+        # ★ 2026-10-09 修正：起点位置必须**在按下时记一次**。
+        #   原来每次 Motion 都读 winfo_x()/winfo_y() —— Tk 的 geometry 请求不是
+        #   立即生效，连续快速拖动时读到的是旧值，于是每帧都把整个位移量再加一遍，
+        #   窗口越拉越偏、最后飞出屏幕（用户实测）。
+        st["px"], st["py"] = win.winfo_x(), win.winfo_y()
+        st["w"], st["h"] = win.winfo_width(), win.winfo_height()
+
+    def _motion(ev):
+        m = st.get("mode")
+        if not m:
+            return
+        dx, dy = ev.x_root - st["x"], ev.y_root - st["y"]
+        x, y, w, h = st["px"], st["py"], st["w"], st["h"]
+        try:
+            sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+        except Exception:
+            sw, sh = 1920, 1080
+        if "e" in m:
+            w = max(min_w, st["w"] + dx)
+        if "s" in m:
+            h = max(min_h, st["h"] + dy)
+        if "w" in m:
+            w = max(min_w, st["w"] - dx)
+            x = st["px"] + (st["w"] - w)
+        if "n" in m:
+            h = max(min_h, st["h"] - dy)
+            y = st["py"] + (st["h"] - h)
+        # ★ 2026-10-09 修正（用户实测"四角拖动直接飞出屏幕外"）：
+        #   ① 起点位置在按下时记一次（见 _press）—— 原来每帧读 winfo_x() 旧值，
+        #      整个位移量被反复叠加，越拉越偏。
+        #   ② 尺寸也要钳制：原来只夹位置，尺寸能涨到比屏幕还大（实测 2420x1486
+        #      在 2560x1440 屏上），视觉上就是"窗口跑没了"。
+        w = min(w, sw)
+        h = min(h, sh)
+        x = max(-w + 60, min(x, sw - 60))
+        y = max(0, min(y, sh - 40))
+        win.geometry("%dx%d+%d+%d" % (w, h, x, y))
+
+    def _release(_ev=None):
+        st["mode"] = None
+
+    def _hover(ev):
+        m = _which(ev)
+        try:
+            win.configure(cursor=CURSORS.get(m, ""))
+        except Exception:
+            pass
+
+    def _leave(_ev=None):
+        try:
+            win.configure(cursor="")
+        except Exception:
+            pass
+
+    def bind_tree(widgets=()):
+        for w in [win] + [x for x in widgets if x is not None]:
+            try:
+                w.bind("<Motion>", _hover, add="+")
+                w.bind("<Button-1>", _press, add="+")
+                w.bind("<B1-Motion>", _motion, add="+")
+                w.bind("<ButtonRelease-1>", _release, add="+")
+            except Exception:
+                pass
+
+    return {"bind_tree": bind_tree, "which": _which}
+
+
+class DarkMenu:
+    """自绘深色菜单（替代 tk.Menu，消掉 Windows 上那 2px 浅色白边）。
+
+    特性：无边框 Toplevel + Win11 圆角 + 悬停高亮 + 分隔线 + 子菜单 + 失焦自动关。
+    用法：
+        m = DarkMenu(root)
+        m.add(label, cmd)
+        m.add_sep()
+        m.add_sub("思考档位…", [("档位A", cb), ...])
+        m.popup(x_root, y_root)
+    """
+
+    def __init__(self, master, width=210, item_dy=5):
+        self.master = master
+        self.width = width
+        self.item_dy = item_dy
+        self.items = []            # (kind, label, cmd, sub)  kind: item/sep
+        self._pop = None
+        self._sub_pop = None
+        self._bind_all_id = None
+        self._labels = []
+        self._sliders = []
+
+    # ---------- 构建 ----------
+    def add(self, label, cmd=None):
+        self.items.append(("item", label, cmd, None))
+        return self
+
+    def add_sep(self):
+        self.items.append(("sep", None, None, None))
+        return self
+
+    def add_sub(self, label, sub_items):
+        self.items.append(("item", label + "  ▸", None, sub_items))
+        return self
+
+    def add_slider(self, label, vmin, vmax, init, cmd, fmt="%d%%"):
+        """加一行「标签 + 滑块」（★ 2026-10-09 用户要求透明度改滑块）。
+
+        cmd 收到的是滑块当前值（float）。拖动时实时回调，菜单不关。
+        """
+        self.items.append(("slider", label, (vmin, vmax, init, cmd, fmt), None))
+        return self
+
+    def clear(self):
+        self.items = []
+
+    # ---------- 弹出 ----------
+    def popup(self, x_root, y_root, parent_pop=None):
+        self.close()
+        pop = tk.Toplevel(self.master)
+        self._pop = pop
+        pop.overrideredirect(True)
+        pop.attributes("-topmost", True)
+        pop.configure(bg=MENU_BG)
+        pop.geometry("+%d+%d" % (x_root, y_root))
+
+        self._labels = []
+        for kind, label, cmd, sub in self.items:
+            if kind == "sep":
+                fr = tk.Frame(pop, bg=MENU_BG, height=1)
+                fr.pack(fill="x", pady=4, padx=6)
+                sep = tk.Frame(fr, bg="#45454f", height=1)
+                sep.pack(fill="x")
+                continue
+            if kind == "slider":
+                # ★ 2026-10-09：滑块行（透明度用）——「标签  值」+ 下方滑块
+                vmin, vmax, init, scmd, sfmt = cmd
+                # ★ 修正（用户反馈「改完透明度后再按右键会回到 100%」）：
+                #   init 支持传 callable → 每次弹出时**现取当前值**。
+                #   原来 init 是程序启动时算死的，菜单每次重建都拿旧值。
+                try:
+                    cur_val = init() if callable(init) else init
+                except Exception:
+                    cur_val = init
+                cur_val = min(vmax, max(vmin, float(cur_val)))
+
+                row = tk.Frame(pop, bg=MENU_BG)
+                row.pack(fill="x", padx=10, pady=(4, 0))
+                tk.Label(row, text=label, bg=MENU_BG, fg=MENU_FG, anchor="w",
+                         font=FONT).pack(side="left")
+                val_lbl = tk.Label(row, text=sfmt % cur_val, bg=MENU_BG, fg=YELLOW,
+                                   anchor="e", font=FONT_CODE_S)
+                val_lbl.pack(side="right")
+
+                def _on_scale(v, lb=val_lbl, c=scmd, fmt=sfmt):
+                    try:
+                        lb.config(text=fmt % float(v))
+                    except Exception:
+                        pass
+                    if c:
+                        try:
+                            c(float(v))
+                        except Exception:
+                            pass
+
+                # ★ 关键：先建 Scale（**不带 command**）→ set 初值 → 再挂 command。
+                #   否则 set() 会立刻触发 command，把透明度重置成初值
+                #   （用户实测：改完再右键就弹回 100%）。
+                sc = tk.Scale(pop, from_=vmin, to=vmax, orient="horizontal",
+                              showvalue=0, resolution=1, length=self.width - 40,
+                              bg=MENU_BG, fg=MENU_FG, troughcolor="#1b1b21",
+                              activebackground=MENU_ACTIVE_BG,
+                              highlightthickness=0, bd=0, sliderrelief="flat")
+                sc.set(cur_val)
+                sc.configure(command=_on_scale)
+                sc.pack(fill="x", padx=12, pady=(0, 4))
+                self._sliders.append(sc)
+                continue
+            lb = tk.Label(pop, text=label, bg=MENU_BG, fg=MENU_FG,
+                          anchor="w", justify="left", padx=14, pady=self.item_dy,
+                          font=FONT)
+            lb.pack(fill="x")
+            self._labels.append(lb)
+            if sub:
+                lb.bind("<Enter>", lambda e, it=sub, w=lb: self._open_sub(it, w))
+            else:
+                lb.bind("<Enter>", lambda e, w=lb: self._close_sub(w))
+                lb.bind("<Button-1>", lambda e, c=cmd: self._invoke(c))
+            lb.bind("<Enter>", self._hl_on, add="+")
+            lb.bind("<Leave>", self._hl_off, add="+")
+
+        pop.update_idletasks()
+        w = self.width
+        h = pop.winfo_reqheight()
+        # 屏幕边界处理
+        try:
+            sw = pop.winfo_screenwidth()
+            sh = pop.winfo_screenheight()
+            x, y = x_root, y_root
+            if x + w > sw:
+                x = max(0, sw - w - 4)
+            if y + h > sh:
+                y = max(0, sh - h - 4)
+            pop.geometry("%dx%d+%d+%d" % (w, h, x, y))
+        except Exception:
+            pop.geometry("%dx%d" % (w, h))
+
+        try:
+            apply_round_corners(pop, 2)
+        except Exception:
+            pass
+        # 失焦/点外面 → 关闭
+        pop.bind("<FocusOut>", lambda e: self.close())
+        pop.focus_force()
+        self._bind_all_id = self.master.bind_all(
+            "<Button-1>", self._on_global_click, add="+")
+        return pop
+
+    def _hl_on(self, ev):
+        try:
+            ev.widget.configure(bg=MENU_ACTIVE_BG, fg=MENU_ACTIVE_FG)
+        except Exception:
+            pass
+
+    def _hl_off(self, ev):
+        try:
+            ev.widget.configure(bg=MENU_BG, fg=MENU_FG)
+        except Exception:
+            pass
+
+    def _invoke(self, cmd):
+        self.close()
+        if cmd:
+            try:
+                self.master.after(10, cmd)
+            except Exception:
+                try:
+                    cmd()
+                except Exception:
+                    pass
+
+    def _on_global_click(self, ev):
+        """点到菜单外面 → 关闭（点菜单里面不关，交给条目自己的绑定处理）。"""
+        try:
+            if self._pop and str(ev.widget).startswith(str(self._pop)):
+                return
+            if self._sub_pop and str(ev.widget).startswith(str(self._sub_pop)):
+                return
+        except Exception:
+            pass
+        self.close()
+
+    # ---------- 子菜单 ----------
+    def _open_sub(self, sub_items, host_label):
+        self._close_sub()
+        pop = tk.Toplevel(self.master)
+        self._sub_pop = pop
+        pop.overrideredirect(True)
+        pop.attributes("-topmost", True)
+        pop.configure(bg=MENU_BG)
+        labels = []
+        for it in sub_items:
+            if it is None:
+                fr = tk.Frame(pop, bg=MENU_BG, height=1)
+                fr.pack(fill="x", pady=4, padx=6)
+                tk.Frame(fr, bg="#45454f", height=1).pack(fill="x")
+                continue
+            lbl, cb = it
+            lb = tk.Label(pop, text=lbl, bg=MENU_BG, fg=MENU_FG, anchor="w",
+                          justify="left", padx=14, pady=self.item_dy, font=FONT)
+            lb.pack(fill="x")
+            labels.append(lb)
+            lb.bind("<Button-1>", lambda e, c=cb: self._invoke(c))
+            lb.bind("<Enter>", self._hl_on, add="+")
+            lb.bind("<Leave>", self._hl_off, add="+")
+        pop.update_idletasks()
+        try:
+            sw = pop.winfo_screenwidth()
+            sh = pop.winfo_screenheight()
+            hx = host_label.winfo_rootx()
+            hy = host_label.winfo_rooty()
+            w = self.width + 20
+            h = pop.winfo_reqheight()
+            x = hx + host_label.winfo_width() - 6
+            y = hy
+            if x + w > sw:
+                x = max(0, hx - w + 6)
+            if y + h > sh:
+                y = max(0, sh - h - 4)
+            pop.geometry("%dx%d+%d+%d" % (w, h, x, y))
+        except Exception:
+            pass
+        try:
+            apply_round_corners(pop, 2)
+        except Exception:
+            pass
+
+    def _close_sub(self, _ev=None):
+        if self._sub_pop is not None:
+            try:
+                self._sub_pop.destroy()
+            except Exception:
+                pass
+            self._sub_pop = None
+
+    def close(self, _ev=None):
+        self._close_sub()
+        if self._bind_all_id:
+            try:
+                self.master.unbind_all("<Button-1>")
+            except Exception:
+                pass
+            self._bind_all_id = None
+        if self._pop is not None:
+            try:
+                self._pop.destroy()
+            except Exception:
+                pass
+            self._pop = None
+        self._labels = []
+        self._sliders = []
+
+
+_TODAY_SITE_CACHE = {}
+
+
+def today_site_costs(day=None):
+    """今日各站的站方实扣 {站点: {"calls": n, "cost": 元}}（带缓存）。
+
+    权威源 = 站点监控 store.db 的 usage_flows（与面板同口径、同去重规则）。
+    ★ 2026-10-09：用户要求悬浮窗显示「今日站点消费」。
+    缓存 key 必须带 store.db 的 mtime —— 库是后台持续采集的，只看 day 会
+    永远返回首次读到的旧值（同 _site_calls_cached 踩过的坑）。
+    """
+    if not day:
+        day = datetime.now().strftime("%Y-%m-%d")
+    p = os.path.join(_get_proxy_monitor_dir(), "store.db")
+    try:
+        mt = os.path.getmtime(p)
+    except OSError:
+        return {}
+    key = (day, round(mt, 3))
+    hit = _TODAY_SITE_CACHE.get(key)
+    if hit is not None:
+        return hit
+    out = {}
+    try:
+        con = sqlite3.connect("file:%s?mode=ro" % p.replace("\\", "/"), uri=True)
+        for s, n, c in con.execute(
+                "SELECT site, COUNT(*), SUM(cost) FROM usage_flows "
+                "WHERE day = ? AND day != '' AND %s GROUP BY site" % _FLOW_NON_DUP,
+                (day,)):
+            k = canon_host(str(s or ""))
+            a = out.setdefault(k, {"calls": 0, "cost": 0.0})
+            a["calls"] += int(n or 0)
+            a["cost"] += float(c or 0)
+        con.close()
+    except Exception:
+        return {}
+    if len(_TODAY_SITE_CACHE) >= 4:
+        _TODAY_SITE_CACHE.clear()
+    _TODAY_SITE_CACHE[key] = out
+    return out
+
+
+def today_site_total(day=None):
+    """今日所有站点的消费合计（元）。返回 (总额, 站点数, 调用数)。"""
+    d = today_site_costs(day)
+    if not d:
+        return (None, 0, 0)
+    return (sum(v["cost"] for v in d.values()), len(d),
+            sum(v["calls"] for v in d.values()))
+
+
 APP_NAME = "HermesCacheMonitor"
-APP_VERSION = "1.2.1"
+APP_VERSION = "1.3.0"
 
 # 数据目录分裂检测结果（由 _appdata_dir() 填充）：非空 = 发现 MSIX 虚拟化影子目录
 _DATA_SPLIT = ""
@@ -528,6 +1153,25 @@ GREEN = "#4ade80"       # 现代柔和荧光翠绿（不刺眼）
 YELLOW = "#fbbf24"      # 浅暖琥珀金
 RED = "#f87171"         # 柔和浅珊瑚红
 BLUE = "#38bdf8"        # 浅天青蓝
+
+# 右键菜单配色（2026-10-09）：与 Windows 系统深色原生菜单观感一致
+MENU_BG = "#2c2c2c"
+MENU_FG = "#e8e8ee"
+MENU_ACTIVE_BG = "#3a3a44"
+MENU_ACTIVE_FG = "#ffffff"
+MENU_STYLE = dict(bg=MENU_BG, fg=MENU_FG, activebackground=MENU_ACTIVE_BG,
+                  activeforeground=MENU_ACTIVE_FG, bd=0, relief="flat")
+
+# 透明度下限（★ 2026-10-09 用户要求：最低 30%）——再低就看不清字了
+MIN_ALPHA = 0.30
+
+# ★ 2026-10-09 窗口尺寸下限（统一出口）
+#   教训：这些值原来散落在切换模式处写死（max(300,…)、max(280,…)），而拉伸热区用的是
+#   另一套（min_w=240/min_h=80）→ 用户手动能缩到 240，一切换模式就被抬回 300。
+#   现在两边共用同一组常量，绝不允许再出现两套标准。
+_MIN_W = 240
+_MIN_MINI_H = 80
+_MIN_FULL_H = 80
 
 # 字体系统：中文用微软雅黑色（UI版圆润），数字与英文字符用 Windows 原生现代等宽 Cascadia Code
 FONT = ("Microsoft YaHei UI", 9)
@@ -2275,6 +2919,7 @@ def sync_prices_from_proxy(price_book):
             return False, "无有效中转流水数据"
 
         count = 0
+        skipped = []          # ★ 2026-10-08：按次收费的站跳过反推
         today_str = datetime.now().strftime("%Y-%m-%d")
         for site, model, n, inp, cr, out, cost in rows:
             if not model or model == "*" or n < 3:
@@ -2308,20 +2953,42 @@ def sync_prices_from_proxy(price_book):
                 "note": "中转站实扣自动同步 (基于%d条流水)" % n,
                 "updated": today_str
             }
+            # ★ 2026-10-08：按次收费的站**不参与**这种「按 token 反推单价」的同步。
+            #   理由：它实扣 = 次数 × 单价，跟 token 量没关系，反推出来的单价
+            #   会严重失真（把固定费摊进 token），反而把配置搞坏。
+            _old = price_book.match(site, model) or {}
+            try:
+                _opc = float(_old.get("per_call") or 0)
+            except (TypeError, ValueError):
+                _opc = 0.0
+            if _opc > 0:
+                skipped.append("%s/%s" % (site, model))
+                continue
             price_book.upsert(new_entry, keep_ratio=False)
             count += 1
 
         price_book._write(price_book._entries)
-        return True, "已成功从真实流水同步 %d 个模型实扣价格与倍率！" % count
+        msg = "已成功从真实流水同步 %d 个模型实扣价格与倍率！" % count
+        if skipped:
+            msg += "（%d 个按次收费的站已跳过：%s）" % (len(skipped), "、".join(skipped[:3]))
+        return True, msg
     except Exception as e:
         return False, "同步失败：%s" % e
 
 
-def compute_cost(entry, miss, hit, out, now_hm=None, day=None):
+def compute_cost(entry, miss, hit, out, now_hm=None, day=None, calls=None):
     """按价格条目算成本。返回 dict 或 None（未配价）。
 
     *ratio* = 实收倍率（对齐站点真实账单）：成本与"缓存省"都要乘它。
     *day* = "YYYY-MM-DD"，用于峰谷的周末判定（weekend_off）。
+
+    ★ 2026-10-08 新增按次收费（用户拍板）：
+        条目里写了 per_call（每次 X 元）→ 成本 = calls × per_call。
+        token 明细（缓存/未命中）仍照常显示，但**不参与计价**；
+        「缓存省」直接置 0（按次收费时缓存命中并不省钱）。
+        calls 没传时返回 None（无法计算）—— 调用方应尽量传：
+          优先用**站点监控库**的流水条数（站方口径最准），
+          没有才退回 Hermes 本地的模型调用次数。
 
     ⚠ 不要把 reasoning（思考）token 加进 out 计费（2026-09-22 试过并回退）：
       证据 = 有站方 token 明细的锚点站（tokenrhythm）显示「站方 out = 我们 out」
@@ -2338,7 +3005,31 @@ def compute_cost(entry, miss, hit, out, now_hm=None, day=None):
     if entry.get("tag") == "免费":
         return {"cost": 0.0, "saved": 0.0, "list_cost": 0.0, "cur": cur,
                 "free": True, "period": None, "ratio": ratio,
-                "seg_from": entry.get("_seg_from") or ""}
+                "seg_from": entry.get("_seg_from") or "", "per_call": None,
+                "calls": None}
+
+    # ── ★ 按次收费：不看 token，成本 = 次数 × 每次费用 ──
+    try:
+        _pc = float(entry.get("per_call") or 0)
+    except (TypeError, ValueError):
+        _pc = 0.0
+    if _pc > 0:
+        if calls is None:
+            return None                      # 没次数算不了（调用方需传）
+        # ⚠ calls 校验：负数会产出负成本（比不显示更误导）、非数字会抛异常
+        #   打断整轮刷新。脏值一律当「算不了」处理。
+        try:
+            _n = int(calls)
+        except (TypeError, ValueError):
+            return None
+        if _n < 0:
+            return None
+        return {"cost": _n * _pc, "list_cost": _n * _pc,
+                "saved": 0.0,                    # 按次：缓存不省钱
+                "cur": cur, "free": False, "period": None, "ratio": ratio,
+                "seg_from": entry.get("_seg_from") or "",
+                "per_call": _pc, "calls": int(calls)}
+
     grp = entry
     period = None
     if entry.get("peak") or entry.get("off"):
@@ -2360,7 +3051,118 @@ def compute_cost(entry, miss, hit, out, now_hm=None, day=None):
         "period": period,
         "ratio": ratio,
         "seg_from": entry.get("_seg_from") or "",
+        "per_call": None,
+        "calls": None,
     }
+
+
+def site_call_counts(since_ts=None, until_ts=None):
+    """★ 2026-10-08：按「站×模型」取调用次数（用于按次计费）。
+
+    取数原则（用户拍板：**以站点监控为主**）：
+      ① 站点监控库 store.db 的 usage_flows 流水条数（站方口径，最准）
+      ② 读不到站点监控 → 返回 {}，由调用方退回本地调用次数
+
+    返回 {"host|model": n}；host 已按 canon_host 归一。
+    """
+    p = os.path.join(_get_proxy_monitor_dir(), "store.db")
+    if not os.path.isfile(p):
+        return {}
+    out = {}
+    try:
+        con = sqlite3.connect("file:%s?mode=ro" % p.replace("\\", "/"), uri=True)
+        sql = ("SELECT site, model, COUNT(*) FROM usage_flows "
+               "WHERE day != '' AND %s" % _FLOW_NON_DUP)
+        args = []
+        if since_ts:
+            sql += " AND ts >= ?"
+            args.append(int(since_ts))
+        if until_ts:
+            sql += " AND ts <= ?"
+            args.append(int(until_ts))
+        sql += " GROUP BY site, model"
+        for s, m, n in con.execute(sql, args):
+            h = canon_host(str(s or "").strip())
+            mm = canon_model(str(m or "").strip() or "*")
+            k = "%s|%s" % (h, mm)
+            out[k] = out.get(k, 0) + (n or 0)
+        con.close()
+    except Exception:
+        return {}
+    return out
+
+
+_SITE_CALLS_CACHE = {}
+
+
+def calls_for(host, model, since_ts=None, until_ts=None, fallback=None,
+              prefer_site=False):
+    """★ 2026-10-08：取某「站×模型」的调用次数，供按次计费使用。
+
+    口径说明（★ 2026-10-08 修正）：
+      默认 **以本地 *fallback* 为准**（= 当前会话/当前对象的真实调用数）。
+      理由：浮窗整个界面都是「当前这个对话」的口径（会话 ID、命中率、成本
+      都是本会话），按次计费必须同口径。而站点监控的流水是**站×模型的全量
+      累计**，没有会话维度 —— 直接拿来用会让浮窗显示一串跟当前对话无关的
+      累计账单（实测：本会话 373 次，站点监控全量 3790 次，差 10 倍）。
+
+      prefer_site=True 时才反过来（站点监控优先、本地兜底）—— 用于确实要
+      「该站该模型一共花了多少」的场景，如账本聚合/站点维度汇总。
+
+    站点监控查询带 (since,until) 维度的缓存，避免每行都开一次库。
+    """
+    # 默认路径：本地次数说了算（没有本地数才去问站点监控）
+    if not prefer_site:
+        # ⚠ 用 `is not None` 而非真值判断：本地次数**确实是 0**（新会话还没调用）
+        #   时必须返回 0，否则会回落到站点监控的全量次数，把别人的量算到自己头上。
+        if fallback is not None:
+            try:
+                return int(fallback)
+            except (TypeError, ValueError):
+                pass
+        h = canon_host(str(host or "").strip())
+        mm = canon_model(str(model or "").strip() or "*")
+        mp = _site_calls_cached(since_ts, until_ts)
+        v = (mp or {}).get("%s|%s" % (h, mm))
+        return int(v) if v else None
+
+    h = canon_host(str(host or "").strip())
+    mm = canon_model(str(model or "").strip() or "*")
+    mp = _site_calls_cached(since_ts, until_ts)
+    if mp:
+        v = mp.get("%s|%s" % (h, mm))
+        if v:
+            return int(v)
+    # 站点没数 → 用本地兜底（同样是 is not None，0 也是有效值）
+    if fallback is not None:
+        try:
+            return int(fallback)
+        except (TypeError, ValueError):
+            pass
+    return None
+
+
+def _site_calls_cached(since_ts=None, until_ts=None):
+    """带窗口缓存的 site_call_counts（最多留 4 组，避免长跑占内存）。
+
+    ⚠ 缓存 key 必须带 store.db 的 mtime：站点监控是后台持续采集的，库一直在长。
+    只用 (since,until) 当 key 的话，进程内会永远返回首次读到的旧值 → 按次金额
+    长期不涨（实测：插 5 条流水后新值 3832，缓存仍返 3827）。
+    """
+    try:
+        mt = os.path.getmtime(os.path.join(_get_proxy_monitor_dir(), "store.db"))
+    except OSError:
+        mt = None
+    key = (round(since_ts, 3) if since_ts else None,
+           round(until_ts, 3) if until_ts else None,
+           round(mt, 3) if mt else None)
+    mp = _SITE_CALLS_CACHE.get(key)
+    if mp is None:
+        mp = site_call_counts(since_ts, until_ts)
+        if len(_SITE_CALLS_CACHE) >= 4:
+            _SITE_CALLS_CACHE.clear()
+        _SITE_CALLS_CACHE[key] = mp
+    return mp
 
 
 # ─────────────────────────── 日志账本（缺账检测） ───────────────────────────
@@ -2851,7 +3653,17 @@ class Monitor:
             except Exception:
                 chost = canon_host(cprov or "?")
             entry = self.prices.match(chost, cmodel, day)
-            r = compute_cost(entry, cin, ccr, cout, now_hm, day=day)
+            # ★ 2026-10-08：按次收费需要次数 —— 优先站点监控，退回本地。
+            #   子会话的本地次数从 sessions 表取（api_call_count）。
+            _cc = None
+            try:
+                _r = db_query("SELECT COALESCE(api_call_count,0) FROM sessions "
+                              "WHERE id=?", (cid,), one=True)
+                _cc = _r[0] if _r else None
+            except Exception:
+                _cc = None
+            r = compute_cost(entry, cin, ccr, cout, now_hm, day=day,
+                             calls=calls_for(chost, cmodel, fallback=_cc))
             if r is None:
                 unpriced += 1
             else:
@@ -3066,7 +3878,10 @@ class Monitor:
         now_hm = datetime.now().strftime("%H:%M")
 
         entry = self.prices.match(d["site"], d["model"])
-        d["priced"] = compute_cost(entry, d["inp"], d["cr"], d["out"], now_hm)
+        # ★ 2026-10-08：按次收费需要次数（优先站点监控，退回本会话 api_call_count）
+        d["priced"] = compute_cost(
+            entry, d["inp"], d["cr"], d["out"], now_hm,
+            calls=calls_for(d.get("site"), d.get("model"), fallback=d.get("calls")))
         d["price_entry"] = entry
         d["children"] = self._children_cost(sid, now_hm)
         calib = self.calib_mgr.get_session_calib(sid) if hasattr(self, "calib_mgr") else None
@@ -3083,7 +3898,9 @@ class Monitor:
         est = d["estimate"]
         if est:
             if entry:
-                ec = compute_cost(entry, est["miss"], est["hit"], est["out"], now_hm)
+                ec = compute_cost(entry, est["miss"], est["hit"], est["out"], now_hm,
+                                  calls=calls_for(d.get("site"), d.get("model"),
+                                                  fallback=d.get("calls")))
                 est["cost"] = ec["cost"] if ec else None
             else:
                 est["cost"] = None
@@ -3280,6 +4097,7 @@ class PriceDialog:
         self.win.attributes("-topmost", True)
         apply_icon(self.win)
         apply_dark_title_bar(self.win, bg_hex=BG)
+        style_child_window(self.win, tree=False)   # ★ 2026-10-09 统一子窗口外观
         self.win.resizable(False, False)
         self.win.transient(root)
 
@@ -3320,6 +4138,21 @@ class PriceDialog:
             side="left", padx=(3, 0))
         for _w in (self.e_ratio, self.e_in, self.e_out, self.e_cache):
             _w.bind("<KeyRelease>", lambda _e: self._preview())
+
+        # ★ 2026-10-08 按次收费：填了就改走「成本 = 调用次数 × 每次费用」，
+        #   不看 token（缓存/未命中仍显示，但「缓存省」不再显示）。
+        f = frm(3)
+        self.v_percall = tk.BooleanVar(value=bool(e.get("per_call")))
+        tk.Checkbutton(f, text="按次收费（不看 token）", variable=self.v_percall,
+                       bg=BG, fg=FG, selectcolor=BG, activebackground=BG,
+                       activeforeground=FG, font=FONT_S,
+                       command=self._toggle_percall).pack(side="left")
+        tk.Label(f, text="每次", bg=BG, fg=FG, font=FONT).pack(side="left", padx=(8, 0))
+        self.e_percall = self._entry(f, e.get("per_call", ""), w=8)
+        tk.Label(f, text="元/次", bg=BG, fg=DIM, font=FONT_S).pack(side="left", padx=(4, 0))
+        tk.Label(f, text="（浮窗按本会话次数算；站点页按该站累计）", bg=BG, fg=DIM,
+                 font=FONT_S).pack(side="left", padx=(6, 0))
+        self.e_percall.bind("<KeyRelease>", lambda _e: self._preview())
 
         # 峰谷
         f = frm(4)
@@ -3459,6 +4292,21 @@ class PriceDialog:
         self._put(self.e_of_cache, of.get("cache"))
         self._toggle_peak()
         self._refresh_seg_label()
+        self._toggle_percall()          # ★ 2026-10-08：按次开关的初始状态
+
+    def _toggle_percall(self):
+        """★ 2026-10-08：按次收费开关 —— 开了就把 token 单价输入框灰掉（不参与计价）。"""
+        on = bool(self.v_percall.get())
+        for w in (self.e_in, self.e_out, self.e_cache):
+            try:
+                w.config(state=("disabled" if on else "normal"))
+            except Exception:
+                pass
+        try:
+            self.e_percall.config(state=("normal" if on else "disabled"))
+        except Exception:
+            pass
+        self._preview()
 
     def _stash_seg(self):
         """把输入框当前值存回当前段（宽松存，严格校验留到 save）。"""
@@ -3553,12 +4401,28 @@ class PriceDialog:
             pass
 
     def _preview(self):
-        """倍率预览：标价 × 倍率 = 实收。"""
+        """倍率预览：标价 × 倍率 = 实收。
+
+        ★ 2026-10-08：按次模式显示「每次 X 元 → 20 次约 ¥Y」的提示，
+          而不是 token 单价预览（那个此时不参与计价）。
+        """
         def v(w):
             try:
                 return float(w.get().strip() or 0)
             except ValueError:
                 return None
+
+        # 按次收费：预览按次单价即可（次数取实时值意义不大且要有会话上下文）
+        if self.v_percall.get():
+            pc = v(self.e_percall)
+            if not pc or pc <= 0:
+                self.lbl_msg.config(text="按次收费：请填「每次 X 元」", fg=RED)
+            else:
+                self.lbl_msg.config(
+                    text="按次收费 ¥%.4g/次（不看 token；成本 = 调用次数 × 单价）" % pc,
+                    fg=BLUE)
+            return
+
         try:
             r = float(self.e_ratio.get().strip() or 1.0)
         except ValueError:
@@ -3708,6 +4572,19 @@ class PriceDialog:
                 "cur": self.entry.get("cur") or "¥",
                 "updated": datetime.now().strftime("%Y-%m-%d"),
             }
+            # ★ 2026-10-08 按次收费：写入 per_call（勾了才写，>0 才有效）
+            pc = num(self.e_percall.get()) if self.v_percall.get() else None
+            # ⚠ 勾了「按次收费」但金额空/0 → 明确报错，不静默存成 token 条目
+            #   （那是反效果：用户以为按次，实际按 token 计价且 token 价是 0）。
+            if self.v_percall.get() and (not pc or pc <= 0):
+                messagebox.showerror("按次收费", "勾了「按次收费」就得填每次金额（>0）。\n"
+                                     "不想按次请取消勾选。", parent=self)
+                return
+            if pc and pc > 0:
+                rec["per_call"] = pc
+                # 按次模式下 token 单价强制清零，避免两个口径混算
+                for _s in periods:
+                    _s["in"] = _s["out"] = _s["cache"] = 0.0
             if len(periods) > 1 or (periods and periods[0].get("from")):
                 rec["periods"] = periods              # 时间轴格式
             else:
@@ -3760,11 +4637,13 @@ class PriceManager:
         self.win.attributes("-topmost", True)
         apply_icon(self.win)
         apply_dark_title_bar(self.win, bg_hex=BG)
+        style_child_window(self.win, tree=True)   # ★ 2026-10-09 统一子窗口外观
         self.win.geometry("640x360")
 
         cols = ("host", "model", "in", "out", "cache", "peak", "updated")
         heads = ("站", "模型", "输入", "输出", "缓存", "峰谷", "更新")
-        self.tree = ttk.Treeview(self.win, columns=cols, show="headings", height=12)
+        self.tree = ttk.Treeview(self.win, columns=cols, show="headings", height=12,
+                                 style="Dark.Treeview")
         for c, h in zip(cols, heads):
             self.tree.heading(c, text=h)
             self.tree.column(c, width=90 if c != "host" else 170, anchor="w")
@@ -3783,7 +4662,7 @@ class PriceManager:
                   bg="#2f5d3a", fg=FG, bd=0, activebackground="#3a7248",
                   activeforeground=FG, font=FONT).pack(side="right", padx=3)
 
-        self.menu = tk.Menu(self.win, tearoff=0)
+        self.menu = tk.Menu(self.win, tearoff=0, **MENU_STYLE)
         self.menu.add_command(label="编辑", command=self.edit)
         self.menu.add_command(label="删除", command=self.delete)
         self.refresh()
@@ -3960,8 +4839,12 @@ class CostLedger:
     def _price_cost(self, host, model, d, day=None, now_hm=None):
         """按 *day* 生效的价格段算成本。返回 (cost, ratio, seg_from)。"""
         entry = self.prices.match(host, model, day) if self.prices else None
+        # ★ 2026-10-08：按次收费需次数 —— d 里带 calls 就用它（0 也算有效值），
+        #   没带才去问站点监控（见 calls_for 的 is not None 判断）。
+        _calls = d.get("calls")
         c = compute_cost(entry, d.get("in", 0), d.get("hit", 0), d.get("out", 0),
-                         now_hm=now_hm, day=day)
+                         now_hm=now_hm, day=day,
+                         calls=calls_for(host, model, fallback=_calls))
         if not c:
             return None, None, ""
         return round(c["cost"], 6), c["ratio"], c.get("seg_from") or ""
@@ -4016,9 +4899,15 @@ class CostLedger:
                     continue
                 scanned += 1
                 day_arg = None if mode == "all" else day
+                # ★ 2026-10-08 修：必须把该天该模型**自己存的 calls** 传下去。
+                #   原来这里只传 in/hit/out，_price_cost 里 d.get("calls")=None
+                #   → 按次模式回落站点监控全量 → 把「有史以来全部次数」重复
+                #   记进每一天（实测 3 天 ×10 次本该 ¥2.4，算成 ¥918.48）。
                 cost, ratio, seg = self._price_cost(
                     host, model,
-                    {"in": v.get("in") or 0, "hit": v.get("hit") or 0, "out": v.get("out") or 0},
+                    {"in": v.get("in") or 0, "hit": v.get("hit") or 0,
+                     "out": v.get("out") or 0,
+                     "calls": v.get("calls") or 0},
                     day=day_arg, now_hm=hm)
                 old = v.get("cost")
                 if cost is None:
@@ -4316,17 +5205,33 @@ class CostLedger:
             model = canon_model(model)
             key = "%s|%s" % (h, model)
             a = agg.setdefault(key, {"calls": 0, "in": 0, "hit": 0, "out": 0,
-                                     "cost": 0.0, "unpriced": False})
+                                     "cost": 0.0, "unpriced": False,
+                                     "entry": None})
             a["calls"] += calls or 0
             a["in"] += inp or 0
             a["hit"] += hit or 0
             a["out"] += o or 0
-            entry = self.prices.match(h, model) if self.prices else None
-            c = compute_cost(entry, inp or 0, hit or 0, o or 0, day=today)
+            a["entry"] = self.prices.match(h, model) if self.prices else None
+        # ★ 2026-10-08 修：成本必须**循环后统一算一次**。
+        #   原来在循环体内逐行算 + 累加 —— 按 token 计价时因为 (in+cr+out) 线性
+        #   相加，结果恰好正确；但**按次计价**是「总次数 × 单价」，逐行算会把
+        #   次数重复计入（第 2 行时 calls 已含第 1 行）→ 金额翻倍。实测推理发现。
+        for key, a in agg.items():
+            h, _, model = key.partition("|")
+            # ★ 口径：聚合是「站×模型」的累计视角 → 要站点口径。
+            #   ⚠ 必须把 live() 的窗口原样传下去！否则 site_call_counts 会查
+            #   全表，按次金额 =「该站上线以来全部调用 × 单价」，跟窗口无关
+            #   （实测：查「今天」显示 3827 次 ×0.08 = ¥306，而当天实际 482 次）。
+            c = compute_cost(a["entry"], a["in"], a["hit"], a["out"], day=today,
+                             calls=calls_for(h, model, since_ts=since_ts,
+                                             until_ts=until_ts,
+                                             fallback=a.get("calls"),
+                                             prefer_site=True))
             if c is None:
                 a["unpriced"] = True
             else:
                 a["cost"] += c["cost"]
+            a.pop("entry", None)
         return agg
 
     # ---------- 站方真值优先 ----------
@@ -4532,6 +5437,7 @@ class SiteMergeDialog:
         self.win.attributes("-topmost", True)
         apply_icon(self.win)
         apply_dark_title_bar(self.win, bg_hex=BG)
+        style_child_window(self.win, tree=False)   # ★ 2026-10-09 统一子窗口外观
         self.win.transient(root)
         self.win.geometry("780x600")
 
@@ -4768,6 +5674,7 @@ class GapDialog:
         self.win.attributes("-topmost", True)
         apply_icon(self.win)
         apply_dark_title_bar(self.win, bg_hex=BG)
+        style_child_window(self.win, tree=True)   # ★ 2026-10-09 统一子窗口外观
         self.win.geometry("520x430")
 
         self.sid = sid
@@ -4804,7 +5711,7 @@ class GapDialog:
         mid.pack(side="top", fill="both", expand=True, padx=12, pady=8)
         vs = ttk.Scrollbar(mid, orient="vertical")
         self.tree = ttk.Treeview(mid, columns=("t", "k", "v"), show="headings",
-                                 height=10, yscrollcommand=vs.set)
+                                 height=10, yscrollcommand=vs.set, style="Dark.Treeview")
         vs.config(command=self.tree.yview)
         for c, h, w in (("t", "时间", 90), ("k", "类型", 70), ("v", "估算", 280)):
             self.tree.heading(c, text=h)
@@ -4872,6 +5779,7 @@ class StatsDialog:
         self.win.attributes("-topmost", True)
         apply_icon(self.win)
         apply_dark_title_bar(self.win, bg_hex=BG)
+        style_child_window(self.win, tree=True)   # ★ 2026-10-09 统一子窗口外观
         self.win.geometry("700x470")
 
         top = tk.Frame(self.win, bg=BG)
@@ -4901,7 +5809,8 @@ class StatsDialog:
         cols = ("site", "model", "calls", "rate", "inp", "out", "cost", "share")
         heads = ("站", "模型", "调用", "命中率", "命中 / 未命中", "输出", "成本", "占比")
         widths = (150, 130, 55, 60, 150, 75, 80, 55)
-        self.tree = ttk.Treeview(self.win, columns=cols, show="headings", height=12)
+        self.tree = ttk.Treeview(self.win, columns=cols, show="headings", height=12,
+                                 style="Dark.Treeview")
         for c, h, w in zip(cols, heads, widths):
             self.tree.heading(c, text=h)
             self.tree.column(c, width=w, anchor="w")
@@ -5238,6 +6147,7 @@ class BillDialog:
         self.win.attributes("-topmost", True)
         apply_icon(self.win)
         apply_dark_title_bar(self.win, bg_hex=BG)
+        style_child_window(self.win, tree=False)   # ★ 2026-10-09 统一子窗口外观
         self.win.resizable(False, False)
         self.win.transient(root)
 
@@ -5656,6 +6566,7 @@ class HintDialog:
         self.win.attributes("-topmost", True)
         apply_icon(self.win)
         apply_dark_title_bar(self.win, bg_hex=BG)
+        style_child_window(self.win, tree=False)   # ★ 2026-10-09 统一子窗口外观
         self.win.resizable(False, False)
         self.win.transient(root)
 
@@ -5909,11 +6820,15 @@ class App:
         cfg = load_config()
         self.alpha = float(cfg.get("alpha", 0.90))
         self.mini_mode = bool(cfg.get("mini_mode", False))
-        # 尺寸记忆：宽度全局保持，高度各自独立记忆
-        self.win_w = int(cfg.get("win_w", 420))
+        # ★ 2026-10-09 用户拍板：完整/精简模式**各自记住宽和高**，切换时不互相继承
+        #   （旧行为：宽度全局共用 win_w，高度各自记忆 → 宽被继承）
+        self.full_w = int(cfg.get("full_w", cfg.get("win_w", 420)))
         _def_h = 286 + (18 if (_uia is None or _NO_UIA or _DATA_SPLIT) else 0)
         self.full_h = int(cfg.get("full_h", _def_h))
-        self.mini_h = int(cfg.get("mini_h", 86))
+        self.mini_w = int(cfg.get("mini_w", cfg.get("win_w", 420)))
+        self.mini_h = int(cfg.get("mini_h", 104))
+        # 兼容旧字段：win_w 作为「当前模式的宽」的别名（其他代码仍在读它）
+        self.win_w = self.mini_w if self.mini_mode else self.full_w
 
         self.root = tk.Tk()
         self.root.title("缓存跟随监控 v%s" % APP_VERSION)
@@ -5921,6 +6836,13 @@ class App:
             len(_ICON_B64), HERMES_HOME or "(未找到)", WORK_DIR, _NO_UIA, _PROFILE))
         apply_icon(self.root)
         apply_dark_title_bar(self.root, bg_hex=BG)
+        # ★ 2026-10-09 界面优化：去掉整条系统标题栏（省 32px 高度）。
+        #   用户拍板：只用得到最小化/×，已全部移入右键菜单；
+        #   拖动由 bind_window_drag() 接管（留出非交互文字区）。
+        try:
+            self.root.overrideredirect(True)
+        except Exception as e:
+            _startup_log("去掉系统标题栏失败（不影响功能）：%s" % e)
         sw = self.root.winfo_screenwidth()
         self.root.attributes("-topmost", True)
         self.root.configure(bg=BG)
@@ -6000,8 +6922,16 @@ class App:
                                   wraplength=max(140, self.win_w - 60))
         self.lbl_title.pack(side="left", fill="x", expand=True)
 
-        self.lbl_rate = tk.Label(self.frm_full, text="--", bg=BG, fg=GREEN, font=FONT_L, anchor="w")
-        self.lbl_rate.pack(side="top", fill="x", padx=12)
+        # ★ 2026-10-09：命中率 + 今日站点消费同一行
+        #   用户要求「今日站点消费放在缓存命中边上」——共行不额外占高度。
+        frm_rate = tk.Frame(self.frm_full, bg=BG)
+        frm_rate.pack(side="top", fill="x", padx=12)
+        self.lbl_rate = tk.Label(frm_rate, text="--", bg=BG, fg=GREEN, font=FONT_L, anchor="w")
+        self.lbl_rate.pack(side="left")
+        # 数据源 = 站点监控 store.db 当天实扣合计（today_site_total）。
+        self.lbl_today = tk.Label(frm_rate, text="", bg=BG, fg=DIM, font=FONT_CODE_S,
+                                  anchor="e", justify="right")
+        self.lbl_today.pack(side="right")
 
         self.lbl_detail = tk.Label(self.frm_full, text="", bg=BG, fg=DIM, font=FONT,
                                    anchor="w", justify="left", wraplength=max(180, self.win_w - 28))
@@ -6010,10 +6940,16 @@ class App:
         self.lbl_cost = tk.Label(self.frm_full, text="", bg=BG, fg=YELLOW, font=FONT_CODE,
                                  anchor="w", justify="left", cursor="hand2", wraplength=max(180, self.win_w - 28))
         self.lbl_cost.pack(side="top", fill="x", padx=12, pady=(2, 0))
-        self.lbl_cost.bind("<Button-1>", self.on_cost_click)
-        self.lbl_cost.bind("<Button-3>", self.on_cost_right)
+        # ★ 2026-10-09 用户要求：成本行「双击」才弹价格配置窗（单击太容易误触）
+        #   注意：Tk 的双击会先发两次 <Button-1> 再发 <Double-Button-1>，
+        #   所以**必须摘掉单击绑定**，否则单击就会弹窗，双击还会弹两次。
+        self.lbl_cost.bind("<Double-Button-1>", self.on_cost_click)
+        # 成本行的右键不要任何动作（原来弹价格管理表，取消）；连主菜单也不弹 → 吞掉事件
+        self.lbl_cost.bind("<Button-3>", lambda _e: "break")
 
-        # === 迷你模式容器 ===
+        # === 迷你模式容器（★ 2026-10-09 极简三行改造） ===
+        #   用户拍板：只留 ①命中率 ②缓存/未缓存 token ③校准后金额，外加今日站点消费；
+        #   「相加相减/已校准/子代理/缓存省」这些过程文字一律不显示。
         self.frm_mini = tk.Frame(self.root, bg=BG)
         frm_mini_top = tk.Frame(self.frm_mini, bg=BG)
         frm_mini_top.pack(fill="x", padx=10, pady=(6, 2))
@@ -6024,65 +6960,117 @@ class App:
         self.btn_expand.pack(side="right", padx=(6, 0))
         self.btn_expand.bind("<Button-1>", lambda _e: self.toggle_mini_mode())
 
+        # 今日站点消费（精简模式也显示，靠右）
+        self.mini_lbl_today = tk.Label(frm_mini_top, text="", bg=BG, fg=DIM,
+                                       font=FONT_CODE_S)
+        self.mini_lbl_today.pack(side="right", padx=(6, 8))
+
         self.mini_lbl_rate = tk.Label(frm_mini_top, text="--", bg=BG, fg=GREEN,
                                       font=FONT_L)
         self.mini_lbl_rate.pack(side="left")
 
-        self.mini_lbl_tokens = tk.Label(frm_mini_top, text="", bg=BG, fg=FG,
-                                        font=FONT_CODE_S, wraplength=max(100, self.win_w - 120), justify="left")
-        self.mini_lbl_tokens.pack(side="left", fill="x", expand=True, padx=(8, 0))
+        self.mini_lbl_tokens = tk.Label(self.frm_mini, text="", bg=BG, fg=FG,
+                                        font=FONT_CODE_S, anchor="w",
+                                        justify="left", wraplength=max(100, self.win_w - 24))
+        self.mini_lbl_tokens.pack(fill="x", padx=10)
 
         self.mini_lbl_cost = tk.Label(self.frm_mini, text="", bg=BG, fg=YELLOW,
                                       font=FONT_CODE, anchor="w", justify="left",
                                       wraplength=max(180, self.win_w - 28), cursor="hand2")
         self.mini_lbl_cost.pack(fill="x", padx=10, pady=(0, 6))
-        self.mini_lbl_cost.bind("<Button-1>", self.on_cost_click)
-        self.mini_lbl_cost.bind("<Button-3>", self.on_cost_right)
+        self.mini_lbl_cost.bind("<Double-Button-1>", self.on_cost_click)
+        # 成本行右键不要任何动作（原来弹价格管理表，取消）
+        self.mini_lbl_cost.bind("<Button-3>", lambda _e: "break")
 
         # 初始打包与尺寸
+        #   ★ 2026-10-09 修正：原来这里写死 max(104,…)/max(280,…)，与拉伸下限
+        #   （min_w=240/min_h=80）不一致；统一走 _MIN_* 常量，避免"手动能缩到 240、
+        #   一切换就被抬回去"的割裂感。
         if self.mini_mode:
             self.frm_mini.pack(fill="both", expand=True)
-            self.root.geometry("%dx%d+%d+60" % (self.win_w, max(86, self.mini_h), sw - self.win_w - 20))
+            self.root.geometry("%dx%d+%d+60" % (self.win_w, max(_MIN_MINI_H, self.mini_h),
+                                                sw - self.win_w - 20))
         else:
             self.frm_full.pack(fill="both", expand=True)
-            self.root.geometry("%dx%d+%d+60" % (self.win_w, max(280, self.full_h), sw - self.win_w - 20))
+            self.root.geometry("%dx%d+%d+60" % (self.win_w, max(_MIN_FULL_H, self.full_h),
+                                                sw - self.win_w - 20))
 
         # 监听窗口拖拽尺寸调整（自适应换行并记忆）
         self.root.bind("<Configure>", self.on_window_resize)
 
         # 双击任意控件快速切换极简/完整模式
-        for w in (self.root, self.frm_full, self.frm_mini, self.lbl_title, self.lbl_rate,
-                  self.lbl_detail, self.mini_lbl_rate, self.mini_lbl_tokens, self.mini_lbl_cost):
-            w.bind("<Double-Button-1>", lambda _e: self.toggle_mini_mode())
+        #   ★ 注意：成本行（lbl_cost / mini_lbl_cost）**不在此列** —— 它们的双击
+        #   已被用户指定为「弹价格配置窗」，不能再兼职切模式。
+        #   ★ 必须 return "break"：Tk 的 <Double-Button-1> 会冒泡到 root，而 root
+        #   也绑了同一个回调 → 一次双击被触发两次（切过去又切回来 = 看着没反应）。
+        #   实测抓出（toggle 调用 = [None, None]）。
+        def _on_dbl(_e):
+            self.toggle_mini_mode()
+            return "break"
 
-        # 右键菜单（窗口任意处）：成本统计 / 价格表管理
-        self.menu = tk.Menu(self.root, tearoff=0)
-        self.menu.add_command(label="🗕 切换精简/完整模式", command=self.toggle_mini_mode)
-        self.menu.add_command(label="成本统计…", command=self.open_stats)
-        self.menu.add_command(label="价格表管理…", command=self.on_cost_right)
-        self.menu.add_command(label="⚭ 站点归并设置…", command=self.open_site_merge)
-        self.menu.add_command(label="🔄 重新对齐对话", command=self.do_refresh)
-        self.menu.add_command(label="⚖ 重新加载站方校准", command=self.on_calib_click)
-        self.menu.add_command(label="⚡ 从中转站实扣同步价格表", command=self.do_sync_proxy_prices)
-        self.menu.add_command(label="🌐 打开网页看板 (8788)", command=self.open_web_panel)
-        # 思考档位（新增）
-        self.menu_effort = tk.Menu(self.menu, tearoff=0)
-        self.menu.add_cascade(label="思考档位…", menu=self.menu_effort)
-        # 提示注入（新增）：一级子菜单挂各预设，点预设直接确认注入
-        self.menu_hint = tk.Menu(self.menu, tearoff=0)
-        self.menu.add_cascade(label="提示注入…", menu=self.menu_hint)
-        # 透明度调节
-        self.menu_alpha = tk.Menu(self.menu, tearoff=0)
-        for a_val, a_label in ((1.0, "100% (不透明)"), (0.90, "90% (推荐磨砂)"), (0.80, "80% (半透明)"), (0.70, "70% (高透明)")):
-            self.menu_alpha.add_command(label=a_label, command=lambda v=a_val: self.set_alpha(v))
-        self.menu.add_cascade(label="透明度…", menu=self.menu_alpha)
-        self.menu.add_separator()
-        self.menu.add_command(label="退出程序", command=self.exit_app)
+        for w in (self.root, self.frm_full, self.frm_mini, self.lbl_title, self.lbl_rate,
+                  self.lbl_detail, self.mini_lbl_rate, self.mini_lbl_tokens,
+                  self.lbl_today, self.mini_lbl_today):
+            w.bind("<Double-Button-1>", _on_dbl)
+
+        # ★ 2026-10-09 无边框拖动 + 四边拉伸（见 bind_window_drag / enable_border_resize 注释）
+        #   拖动：绑在 root 上（Tk 的 Motion 事件发给指针所在控件，只绑 Label 会"只有文字能拖"）
+        #   拉伸：四条边+四角 6px 热区，事件绑到所有子控件
+        try:
+            bind_window_drag(self.root, [self.frm_full, self.frm_mini,
+                                         self.lbl_title, self.lbl_detail,
+                                         self.lbl_rate, self.lbl_today,
+                                         self.mini_lbl_rate, self.mini_lbl_tokens,
+                                         self.mini_lbl_today],
+                             is_edge=lambda e: bool(self._edge_of(e)))
+        except Exception as e:
+            _startup_log("拖动绑定失败（不影响功能）：%s" % e)
+
+        # 自绘深色菜单（tk.Menu 在 Windows 上有 2px 浅色白边，实测改不掉 → 自绘）
+        self.menu = DarkMenu(self.root, width=214)
+        self.menu.add("🗕 最小化到托盘", self.on_close_to_tray)
+        self.menu.add_sep()
+        self.menu.add("🗕 切换精简/完整模式", self.toggle_mini_mode)
+        self.menu.add("成本统计…", self.open_stats)
+        self.menu.add("价格表管理…", self.on_cost_right)
+        self.menu.add("⚭ 站点归并设置…", self.open_site_merge)
+        self.menu.add("🔄 重新对齐对话", self.do_refresh)
+        self.menu.add("⚖ 重新加载站方校准", self.on_calib_click)
+        self.menu.add("⚡ 从中转站实扣同步价格表", self.do_sync_proxy_prices)
+        self.menu.add("🌐 打开网页看板 (8788)", self.open_web_panel)
+        self.menu.add_sub("思考档位…", [("（加载中）", None)])
+        self.menu.add_sub("提示注入…", [("（加载中）", None)])
+        # ★ 2026-10-09 用户要求：透明度改回菜单、改成滑块、最低 30%
+        #   只作用于**主窗口**（完整/精简是同一窗口，两者共用）；子窗口一律不透明。
+        #   init 传 lambda：每次弹菜单现取当前值（否则会弹回启动时的旧值）
+        self.menu.add_slider("窗口透明度", 30, 100,
+                             lambda: int(round(self.alpha * 100)), self.set_alpha_pct)
+        self.menu.add_sep()
+        self.menu.add("关闭软件", self.exit_app)
         self.root.bind("<Button-3>", self.on_root_right)
         self._last_settle = 0.0
 
-        # 点击右上角 ✕ 拦截：隐藏到系统托盘区，不退出
+        # ★ 四边/四角拉伸（去掉系统标题栏后原本拉不动）
+        self.resizer = enable_border_resize(self.root, min_w=_MIN_W, min_h=_MIN_MINI_H)
+        try:
+            self.resizer["bind_tree"]([self.frm_full, self.frm_mini,
+                                       self.lbl_title, self.lbl_detail, self.lbl_rate,
+                                       self.lbl_today, self.lbl_cost, self.mini_lbl_rate,
+                                       self.mini_lbl_tokens, self.mini_lbl_cost,
+                                       self.mini_lbl_today])
+        except Exception as e:
+            _startup_log("四边拉伸绑定失败（不影响功能）：%s" % e)
+        # 系统标题栏已去掉 → 无系统 ✕；窗口级关闭仍走托盘（右键菜单里有）
         self.root.protocol("WM_DELETE_WINDOW", self.on_close_to_tray)
+
+        # ★ 2026-10-09：进程级深色菜单（影响原生菜单：托盘菜单）
+        #   tk 菜单已换成自绘 DarkMenu；这里管的是托盘那个原生菜单。
+        force_dark_menus()
+        # ★ 2026-10-09：Win11 原生圆角 + 自带淡阴影（实测对无边框窗口有效）
+        try:
+            self.root.after(60, lambda: apply_round_corners(self.root, 2))
+        except Exception:
+            pass
 
         # 初始化 Windows 系统托盘（隐藏图标区）
         self.tray_icon = None
@@ -6160,31 +7148,73 @@ class App:
         os._exit(0)
 
     # -------- 交互 --------
-    def set_alpha(self, val):
-        self.alpha = float(val)
+    def _edge_of(self, ev):
+        """判断该事件位置是否落在窗口边缘热区（用于拖动/拉伸互斥）。"""
+        try:
+            return self.resizer["which"](ev)
+        except Exception:
+            return None
+
+    def set_alpha(self, val, quiet=False):
+        """设置主窗口透明度（★ 2026-10-09 用户要求：最低 30%、改滑块驱动）。
+
+        只作用于主窗口 root；子窗口一律不透明（见 style_child_window）。
+        quiet=True 用于滑块拖动过程：不弹状态行提示、保存做防抖。
+        """
+        try:
+            v = float(val)
+        except (TypeError, ValueError):
+            return
+        self.alpha = max(MIN_ALPHA, min(1.0, v))
         try:
             self.root.attributes("-alpha", self.alpha)
         except Exception:
             pass
-        cfg = load_config()
-        cfg["alpha"] = self.alpha
-        save_config(cfg)
-        self._flash("透明度已设为 %d%%" % int(self.alpha * 100))
+        # 拖动过程每帧都写盘太浪费 → 防抖保存（松手 0.6 秒后落盘一次）
+        try:
+            if getattr(self, "_alpha_save_job", None):
+                self.root.after_cancel(self._alpha_save_job)
+        except Exception:
+            pass
+        self._alpha_save_job = self.root.after(600, self._save_alpha)
+        if not quiet:
+            self._flash("透明度已设为 %d%%" % int(self.alpha * 100))
+
+    def set_alpha_pct(self, pct):
+        """滑块回调：入参是百分比（30~100）。"""
+        self.set_alpha(float(pct) / 100.0, quiet=True)
+
+    def _save_alpha(self):
+        self._alpha_save_job = None
+        try:
+            cfg = load_config()
+            cfg["alpha"] = self.alpha
+            save_config(cfg)
+        except Exception:
+            pass
 
     def on_window_resize(self, ev):
         """用户拖拽改变窗口大小时：记忆尺寸并动态调整文字折行宽度。"""
         if ev.widget != self.root:
+            return
+        # ★ 2026-10-09 修正（用户实测：「宽度还是继承」）：
+        #   切换模式时我们会主动 geometry() 改成目标模式的尺寸，但 Tk 会先发几个
+        #   **旧尺寸**的 Configure 事件（窗口还没真正变成新尺寸），于是刚写进去的
+        #   full_w/mini_w 立刻被另一个模式的宽覆盖 → 表现成"宽度还是继承"。
+        #   解法：切换期间挂一个闩锁，忽略这些过渡 Configure。
+        if getattr(self, "_resize_lock", False):
             return
         w = ev.width
         h = ev.height
         if w < 100 or h < 30:
             return
 
-        self.win_w = w
+        # ★ 2026-10-09：完整/精简各自记宽高（切换互不继承）
         if self.mini_mode:
-            self.mini_h = h
+            self.mini_w, self.mini_h = w, h
         else:
-            self.full_h = h
+            self.full_w, self.full_h = w, h
+        self.win_w = w          # 兼容旧字段（= 当前模式的宽）
 
         # 动态自适应文字折行宽度
         wrap_val = max(180, w - 28)
@@ -6193,12 +7223,20 @@ class App:
             self.lbl_detail.config(wraplength=wrap_val)
             self.lbl_cost.config(wraplength=wrap_val)
             self.lbl_warn.config(wraplength=wrap_val)
-            self.mini_lbl_tokens.config(wraplength=max(100, w - 120))
+            self.mini_lbl_tokens.config(wraplength=max(100, w - 24))
             self.mini_lbl_cost.config(wraplength=wrap_val)
         except Exception:
             pass
 
     def toggle_mini_mode(self, force=None):
+        # ★ 2026-10-09 防抖（实测抓出）：Tk 的 <Double-Button-1> 在**同一次双击**里
+        #   会被触发两次（以及三击会再触发一次），不加这层会导致"双击切模式 =
+        #   切过去又切回来"，表现成"双击没反应"。
+        if force is None:
+            now = time.time()
+            if now - getattr(self, "_toggle_at", 0) < 0.4:
+                return
+            self._toggle_at = now
         if force is not None:
             self.mini_mode = force
         else:
@@ -6213,23 +7251,33 @@ class App:
 
         cfg = load_config()
         cfg["mini_mode"] = self.mini_mode
-        cfg["win_w"] = self.win_w
+        cfg["full_w"] = self.full_w
         cfg["full_h"] = self.full_h
+        cfg["mini_w"] = self.mini_w
         cfg["mini_h"] = self.mini_h
+        cfg["win_w"] = self.win_w        # 兼容旧字段
         save_config(cfg)
 
-        # 保持当前宽度不重置，高度恢复为对应模式的记忆高度
-        target_w = max(300, self.win_w)
-        if self.mini_mode:
-            self.frm_full.pack_forget()
-            self.frm_mini.pack(fill="both", expand=True)
-            target_h = max(86, self.mini_h)
-            self.root.geometry("%dx%d+%d+%d" % (target_w, target_h, cur_x, cur_y))
-        else:
-            self.frm_mini.pack_forget()
-            self.frm_full.pack(fill="both", expand=True)
-            target_h = max(280, self.full_h)
-            self.root.geometry("%dx%d+%d+%d" % (target_w, target_h, cur_x, cur_y))
+        # ★ 2026-10-09：切到哪个模式就用哪个模式**自己的**宽和高（不再继承宽度）
+        #   切换期间上闩：忽略 Tk 在过渡期发出的旧尺寸 Configure（见 on_window_resize）
+        self._resize_lock = True
+        try:
+            if self.mini_mode:
+                self.frm_full.pack_forget()
+                self.frm_mini.pack(fill="both", expand=True)
+                target_w = max(_MIN_W, self.mini_w)
+                target_h = max(_MIN_MINI_H, self.mini_h)
+                self.root.geometry("%dx%d+%d+%d" % (target_w, target_h, cur_x, cur_y))
+            else:
+                self.frm_mini.pack_forget()
+                self.frm_full.pack(fill="both", expand=True)
+                target_w = max(_MIN_W, self.full_w)
+                target_h = max(_MIN_FULL_H, self.full_h)
+                self.root.geometry("%dx%d+%d+%d" % (target_w, target_h, cur_x, cur_y))
+            self.win_w = target_w
+        finally:
+            # 解锁放到 geometry 生效之后（约 250ms），期间所有 Configure 都丢弃
+            self.root.after(250, lambda: setattr(self, "_resize_lock", False))
 
         if self.last_d:
             try:
@@ -6238,18 +7286,58 @@ class App:
                 pass
 
     def on_root_right(self, ev):
+        """★ 2026-10-09：右键弹出主菜单（自绘 DarkMenu，无白边）。
+
+        子菜单内容每次弹出前重建：思考档位要打勾、提示注入要标当前预设。
+        """
         try:
-            self.show_effort_menu()
+            self._refresh_sub_menus()
         except Exception:
             pass
         try:
-            self.show_hint_menu()
-        except Exception:
-            pass
+            self.menu.popup(ev.x_root, ev.y_root)
+        except Exception as e:
+            _startup_log("右键菜单弹出失败：%s" % e)
+
+    def _refresh_sub_menus(self):
+        """重建「思考档位 / 提示注入」两个子菜单（含当前项标记）。"""
+        for i, (kind, lbl, cmd, sub) in enumerate(self.menu.items):
+            if lbl and lbl.startswith("思考档位"):
+                self.menu.items[i] = ("item", "思考档位…  ▸", None, self._effort_sub())
+            elif lbl and lbl.startswith("提示注入"):
+                self.menu.items[i] = ("item", "提示注入…  ▸", None, self._hint_sub())
+
+    def _effort_sub(self):
         try:
-            self.menu.tk_popup(ev.x_root, ev.y_root)
-        finally:
-            self.menu.grab_release()
+            cur, path = read_effort()
+        except Exception:
+            cur, path = "", ""
+        if not path:
+            return [("（未找到 config.yaml）", None)]
+        out = []
+        for val, name in EFFORT_LEVELS:
+            mark = "✓ " if val == (cur or "") else "   "
+            out.append((mark + name, (lambda v=val: self.switch_effort(v))))
+        return out
+
+    def _hint_sub(self):
+        try:
+            store = HintStore()
+            store.load()
+            cur = store.current_active()
+            presets = store.list_presets()
+        except Exception:
+            return [("（读取失败）", None)]
+        out = [("打开管理…", self.open_hint), None]
+        if not presets:
+            out.append(("（还没有预设）", None))
+            return out
+        for p in presets:
+            name = p.get("name") or ""
+            mark = "● " if name == cur else "   "
+            out.append((mark + name,
+                        (lambda pr=p: apply_hint_preset_direct(pr, self.root))))
+        return out
 
     def do_sync_proxy_prices(self):
         """从中转站真实流水一键反推并写入价格表。"""
@@ -6280,36 +7368,26 @@ class App:
         webbrowser.open("http://127.0.0.1:8788")
         self._flash("已在浏览器打开中转看板")
 
-    # -------- 思考档位（新增） --------
+    # -------- 思考档位 --------
     def on_footer_click(self, ev):
-        """左键点底部状态行 → 弹档位菜单。"""
+        """左键点底部状态行 → 弹档位菜单（自绘，无白边）。"""
         try:
-            self.show_effort_menu()
+            items = self._effort_sub()
         except Exception:
             return
-        try:
-            self.menu_effort.tk_popup(ev.x_root, ev.y_root)
-        finally:
-            try:
-                self.menu_effort.grab_release()
-            except Exception:
-                pass
+        m = DarkMenu(self.root, width=200)
+        m.add("思考档位", None).add_sep()
+        for it in items:
+            if it is None:
+                m.add_sep()
+            else:
+                m.add(it[0], it[1])
+        m.popup(ev.x_root, ev.y_root)
+        self._effort_popup = m          # 持引用，防止被 GC 掉
 
     def show_effort_menu(self):
-        """每次弹出前重建子菜单，让当前档位打勾。"""
-        cur, path = read_effort()
-        try:
-            self.menu_effort.delete(0, "end")
-        except Exception:
-            pass
-        if not path:
-            self.menu_effort.add_command(label="（未找到 config.yaml）", state="disabled")
-            return
-        for val, name in EFFORT_LEVELS:
-            mark = "✓ " if val == (cur or "") else "   "
-            self.menu_effort.add_command(
-                label="%s%s" % (mark, name),
-                command=(lambda v=val: self.switch_effort(v)))
+        """兼容旧调用点：返回档位项列表（自绘菜单用）。"""
+        return self._effort_sub()
 
     def switch_effort(self, level):
         """带确认框的档位切换。"""
@@ -6343,29 +7421,8 @@ class App:
 
     # -------- 提示注入（新增） --------
     def show_hint_menu(self):
-        """每次弹出前重建子菜单：当前生效的预设打 ●。"""
-        try:
-            store = HintStore()
-            store.load()
-            cur = store.current_active()
-            presets = store.list_presets()
-        except Exception:
-            return
-        try:
-            self.menu_hint.delete(0, "end")
-        except Exception:
-            pass
-        self.menu_hint.add_command(label="打开管理…", command=self.open_hint)
-        self.menu_hint.add_separator()
-        if not presets:
-            self.menu_hint.add_command(label="（还没有预设）", state="disabled")
-            return
-        for p in presets:
-            name = p.get("name") or ""
-            mark = "● " if name == cur else "   "
-            self.menu_hint.add_command(
-                label="%s%s" % (mark, name),
-                command=(lambda pr=p: apply_hint_preset_direct(pr, self.root)))
+        """兼容旧调用点：返回提示注入子菜单项（自绘菜单用）。"""
+        return self._hint_sub()
 
     def open_hint(self):
         """单例打开管理窗（已开着就抬起来）。"""
@@ -6524,17 +7581,30 @@ class App:
             return
         GapDialog(self.root, self.mon, d)
 
-    def on_cost_click(self, _ev=None):
+    def on_cost_click(self, ev=None):
+        """★ 2026-10-09 用户要求：成本行**双击**才弹价格配置窗。
+
+        ⚠️ 必须 return "break"：Tk 的 <Double-Button-1> 会**冒泡到父窗口**，
+        而 root 上绑着「双击切精简/完整模式」（实测：精简模式双击成本行会
+        同时弹出价格窗 + 切模式）。返回 break 阻止冒泡。
+
+        ⚠️ 还要防连击：Tk 把「三击」也会当成一次 Double 再触发，实测快速连点
+        会弹出多个价格窗 → 用 400ms 静默期只认第一次。
+        """
+        now = time.time()
+        if now - getattr(self, "_cost_click_at", 0) < 0.4:
+            return "break"
+        self._cost_click_at = now
         d = self.last_d
-        if not d:
-            return
-        host = d.get("site") or ""
-        model = d.get("model") or ""
-        entry = d.get("price_entry")
-        if entry and entry.get("model") not in ("*", None, "") and entry.get("model") != model:
-            entry = None
-        PriceDialog(self.root, self.mon.prices, host, model,
-                    on_saved=self._price_saved, entry=entry)
+        if d:
+            host = d.get("site") or ""
+            model = d.get("model") or ""
+            entry = d.get("price_entry")
+            if entry and entry.get("model") not in ("*", None, "") and entry.get("model") != model:
+                entry = None
+            PriceDialog(self.root, self.mon.prices, host, model,
+                        on_saved=self._price_saved, entry=entry)
+        return "break"
 
     def on_cost_right(self, _ev=None):
         d = self.last_d or {}
@@ -6561,10 +7631,12 @@ class App:
             self.lbl_detail.config(text="")
             self.lbl_cost.config(text="")
             self.lbl_gap.config(text="")
+            self.lbl_today.config(text="")
             try:
                 self.mini_lbl_rate.config(text="--", fg=DIM)
                 self.mini_lbl_tokens.config(text="")
                 self.mini_lbl_cost.config(text="(无活动对话)")
+                self.mini_lbl_today.config(text="")
             except Exception:
                 pass
             self.last_d = None
@@ -6666,6 +7738,19 @@ class App:
                                        "免费" if not ch["cost"] else fmt_money(ch["cost"], ch["cur"]))
             self.lbl_cost.config(text="≈ 免费%s · 缓存省 %s" % (
                 extra, fmt_money(priced["saved"], priced["cur"])), fg=GREEN)
+        elif priced.get("per_call"):
+            # ★ 2026-10-08 按次收费：成本 = 次数 × 每次费用。
+            #   不显示「缓存省」（按次不看 token，缓存命中并不省钱）。
+            #   子代理的按次费用已在 _children_cost 里各自按次数算好，可并入显示。
+            ch_cost = ch.get("cost") or 0.0
+            cur = priced["cur"]
+            total = priced["cost"] + ch_cost
+            s = "≈ %s · 按次 %d 次 × %s" % (
+                fmt_money(total, cur), priced.get("calls") or 0,
+                fmt_money(priced["per_call"], cur))
+            if ch.get("count"):
+                s += " ｜ 含 %d 子代理 %s" % (ch["count"], fmt_money(ch_cost, cur))
+            self.lbl_cost.config(text=s, fg=YELLOW)
         else:
             base_cost = priced["cost"]
             ch_cost = ch.get("cost") or 0.0
@@ -6707,9 +7792,17 @@ class App:
             tag = ""
             if priced.get("period"):
                 tag = " [%s]" % priced["period"]
-            self.lbl_cost.config(text="%s%s · 缓存省 %s%s%s" % (
-                cost_head, tag,
-                fmt_money(priced["saved"], priced["cur"]), tail, gp))
+            # ★ 2026-10-08 按次收费：成本 = 次数 × 单价，**不显示「缓存省」**
+            #   （按次收费时缓存命中并不省钱，显示它反而误导）。
+            if priced.get("per_call"):
+                self.lbl_cost.config(text="%s%s · 按次 %d 次 × %s%s%s" % (
+                    cost_head, tag,
+                    priced.get("calls") or 0,
+                    fmt_money(priced["per_call"], priced["cur"]), tail, gp))
+            else:
+                self.lbl_cost.config(text="%s%s · 缓存省 %s%s%s" % (
+                    cost_head, tag,
+                    fmt_money(priced["saved"], priced["cur"]), tail, gp))
 
         # 缺账行
         if rep and rep.get("gap"):
@@ -6726,15 +7819,64 @@ class App:
             self.lbl_gap.config(text="")
             self.lbl_gap_detail.config(text="")
 
-        # 同步更新迷你模式控件
+        # 今日站点消费（完整 + 精简 都更新）★ 跟着本对话用过的站走
+        _today_txt = self._today_cost_text(cur_sites)
+        try:
+            self.lbl_today.config(text=_today_txt)
+        except Exception:
+            pass
+
+        # 同步更新迷你模式控件（★ 2026-10-09 极简：只留 命中率 / token / 校准后金额）
         try:
             rate_txt = self.lbl_rate.cget("text")
             rate_fg = self.lbl_rate.cget("fg")
             self.mini_lbl_rate.config(text=rate_txt, fg=rate_fg)
             self.mini_lbl_tokens.config(text="缓存 %s / 未命中 %s" % (fmt_vol(c_cr), fmt_vol(c_inp)))
-            self.mini_lbl_cost.config(text=self.lbl_cost.cget("text"))
+            self.mini_lbl_cost.config(text=self._mini_cost_text(priced, offset))
+            self.mini_lbl_today.config(text=_today_txt)
         except Exception:
             pass
+
+    def _today_cost_text(self, sites=None):
+        """「今日站点 ¥X.XX」——**当前对话所用站点**的今日实扣合计。
+
+        ★ 2026-10-09 用户反馈修正：原来是把**所有站点**当天消费加总，
+          换到别的中转站后显示的仍是 dsh（跟对话无关）→ 改成跟着对话的站走。
+          sites 为当前会话用过的站列表（主站 + session_sites_models 里的）；
+          没有归属站时留空，不显示一个跟当前对话无关的合计。
+        """
+        if not sites:
+            return ""
+        try:
+            allc = today_site_costs()
+        except Exception:
+            return ""
+        if not allc:
+            return ""
+        keys = {canon_host(s) for s in sites if s}
+        matched = [v for k, v in allc.items() if k in keys]
+        if not matched:
+            return ""
+        return "今日站点 ¥%.2f" % sum(v["cost"] for v in matched)
+
+    def _mini_cost_text(self, priced, offset):
+        """精简模式的金额行：★ 只要「校准后的最终金额」，不带任何过程文字。
+
+        用户拍板（2026-10-09）：不显示「相加相减」「已校准」「子代理」「缓存省」，
+        就一个 ≈ ¥X.XX。
+        """
+        if priced is None:
+            return "⚙ 价格未配置"
+        cur = priced.get("cur") or "¥"
+        if priced.get("free"):
+            return "免费"
+        base = priced.get("cost") or 0.0
+        # 有站方校准时，取「校准后的最终金额」（= Hermes 估算 + 补差），但不显示补差过程
+        if offset and offset.get("has_calib"):
+            base = base + (offset.get("diff_cost") or 0.0)
+        elif priced.get("per_call") and (priced.get("cost") is not None):
+            base = priced.get("cost")
+        return "≈ %s" % fmt_money(base, cur)
 
     def tick(self):
         # 智能静止休眠：若窗口最小化或不可见，直接 3 秒后重试，跳过所有重绘与计算
@@ -6826,6 +7968,10 @@ def _dump(m, d):
         print("price:   未配置")
     elif p.get("free"):
         print("price:   免费 ｜ 缓存省 %s" % fmt_money(p["saved"], p["cur"]))
+    elif p.get("per_call"):
+        print("price:   ≈ %s · 按次 %d 次 × %s（不看 token）" % (
+            fmt_money(p["cost"], p["cur"]), p.get("calls") or 0,
+            fmt_money(p["per_call"], p["cur"])))
     else:
         print("price:   ≈ %s%s ｜ 缓存省 %s" % (
             fmt_money(p["cost"] + (d.get("children") or {}).get("cost", 0), p["cur"]),

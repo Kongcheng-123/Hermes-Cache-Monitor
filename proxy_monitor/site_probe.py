@@ -46,8 +46,15 @@ def strip_api_suffix(base_url):
     return b
 
 
-def _get(url, timeout=10):
-    """无鉴权 GET，返回 (status, body)；失败返回 (None, 错误描述)"""
+def _get(url, timeout=10, fast=False):
+    """无鉴权 GET，返回 (status, body)；失败返回 (None, 错误描述)
+
+    fast=True 时用更短的超时（3 秒）—— 探测场景下「没有这个路由」的站
+    会硬等满超时才返回，把超时压短能显著提升体验（实测 20s → 4s）。
+    探测只求「有没有特征路由」，3 秒足够；真连不上的站给再多时间也没用。
+    """
+    if fast:
+        timeout = min(timeout, 3)
     try:
         r = urllib.request.urlopen(
             urllib.request.Request(url, headers={"User-Agent": UA}), timeout=timeout)
@@ -80,20 +87,24 @@ def probe_type(base_url, timeout=10):
     if any(h in low for h in OFFICIAL_HINTS):
         return {"kind": "official", "reason": "官方站（非中转站），无需监控", "root": root}
 
-    # ── 1. sub2api 特征：/v1/sub2api/billing 存在 ──
-    st, body = _get(root + "/v1/sub2api/billing", timeout)
+    # ── 1. NewAPI 特征先探（★ 2026-10-07 调整顺序）──
+    #    /api/status 是轻量只读接口，响应普遍在 1 秒内；
+    #    而 /v1/sub2api/billing 在不存在的路径上会硬等满超时。
+    #    实测：先探 sub2api 时，一个 NewAPI 站要等 20 秒才出结果。
+    st, body = _get(root + "/api/status", timeout, fast=True)
+    if st == 200 and "quota_per_unit" in (body or ""):
+        return {"kind": "newapi", "reason": "/api/status 返回 quota_per_unit", "root": root}
+
+    # ── 2. sub2api 特征：/v1/sub2api/billing 存在 ──
+    st, body = _get(root + "/v1/sub2api/billing", timeout, fast=True)
     if st == 200 and "multiplier" in (body or ""):
         return {"kind": "sub2api", "reason": "/v1/sub2api/billing 返回 rate_multiplier", "root": root}
     if st == 401:
         # 401 说明路由存在、只是要鉴权 —— 这就是 sub2api 的招牌
         return {"kind": "sub2api", "reason": "/v1/sub2api/billing 返回 401（路由存在，需鉴权）", "root": root}
 
-    # ── 2. NewAPI 特征：/api/status 含 quota_per_unit ──
-    st, body = _get(root + "/api/status", timeout)
-    if st == 200 and "quota_per_unit" in (body or ""):
-        return {"kind": "newapi", "reason": "/api/status 返回 quota_per_unit", "root": root}
-
     # ── 3. 兜底：NewAPI 的 /api/status 有时不公开 quota_per_unit，但有 data 结构 ──
+    st, body = _get(root + "/api/status", timeout, fast=True)
     if st == 200 and body:
         try:
             j = json.loads(body)
