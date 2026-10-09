@@ -202,14 +202,8 @@ def bind_window_drag(win, widgets, skip=None, on_click=None, threshold=4,
                 return
             st["moved"] = True
         nx, ny = st["px"] + dx, st["py"] + dy
-        # 别把窗口整个拖到屏幕外（留一点可见，方便抓回来）
-        try:
-            sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
-            ww, wh = win.winfo_width(), win.winfo_height()
-            nx = max(-ww + 60, min(nx, sw - 60))
-            ny = max(0, min(ny, sh - 40))
-        except Exception:
-            pass
+        # ★ 2026-10-09 修：改用「整个虚拟桌面」钳制（原来用主屏尺寸，拖不到副屏）
+        nx, ny = clamp_to_desktop(nx, ny, win.winfo_width(), win.winfo_height(), win)
         win.geometry("+%d+%d" % (nx, ny))
 
     def _release(ev):
@@ -237,7 +231,8 @@ def bind_window_drag(win, widgets, skip=None, on_click=None, threshold=4,
 #  原生外框（activeBorderWidth=0 / 改类画刷 / 去窗口样式 都无效），
 #  所以改用「自绘无边框菜单」（probe_selfmenu.py 验证四边 0 白边 + 可加圆角）。
 
-_RESIZE_EDGE = 6          # 边缘热区宽度（像素）
+_RESIZE_EDGE = 6          # 旧边缘热区宽度（已废弃；保留常量避免外部引用报错）
+_CORNER_EDGE = 14         # ★ 2026-10-09：角热区（只四角能拉伸，四边=纯拖动）
 
 
 def style_dark_tree(root):
@@ -248,6 +243,21 @@ def style_dark_tree(root):
       浅色表格，跟主窗口的碳黑风格完全割裂。
       做法：切到 clam 主题（只有它允许自由改色），再加一个 Dark.Treeview 样式。
       实测表格区底色 #1e1e24、文字 #f4f4f6。
+
+    ★ 2026-10-09 二次修（用户反馈「价格表有白框」）：
+      只设 `st.configure("Dark.Treeview", bordercolor=...)` **不够** ——
+      clam 主题的表格边框不是画在 `Treeview` 元素上，而是画在**子元素
+      `Treeview.field`** 上，它有三个独立的颜色选项，默认值是浅色的：
+          lightcolor  = #eeebe7   （≈ 白，画左边/上边）
+          darkcolor   = #cfcdc8   （≈ 浅灰，画右边/下边）
+          bordercolor = #9e9a91   （≈ 灰，画外框）
+      这三个不设 → 表格外圈会出现一圈白框，和深色背景格格不入。
+      实测证据（tmp/probe_tree_cmp.py，像素采样）：
+          A 组（只设 Treeview 级）→ 边缘像素 (238,235,231) 纯白 ❌
+          B 组（补设 field 级）  → 边缘像素 (30,30,36)  深色 ✅
+      修法：把 field 的这三个色一并钉成单元格底色，并把布局里的 border 归零。
+      注意：field 级的色要跟着 `fieldbackground` 走（此处同为 #1e1e24），
+      否则标题栏与表格之间会留一条异色缝。
     """
     try:
         st = ttk.Style(root)
@@ -255,17 +265,33 @@ def style_dark_tree(root):
             st.theme_use("clam")
         except Exception:
             pass
+        _cell = "#1e1e24"
+        _head = "#26262c"
         st.configure("Dark.Treeview",
-                     background="#1e1e24", foreground=FG,
-                     fieldbackground="#1e1e24",
-                     bordercolor="#2f2f38", borderwidth=0, rowheight=22)
+                     background=_cell, foreground=FG,
+                     fieldbackground=_cell,
+                     bordercolor=_cell, borderwidth=0, rowheight=22,
+                     # ★ 二次修：field 子元素的三个 3D 边框色（不设就是白的）
+                     lightcolor=_cell, darkcolor=_cell)
         st.configure("Dark.Treeview.Heading",
-                     background="#26262c", foreground=FG,
+                     background=_head, foreground=FG,
                      relief="flat", borderwidth=0)
         st.map("Dark.Treeview",
                background=[("selected", MENU_ACTIVE_BG)],
                foreground=[("selected", "#ffffff")])
         st.map("Dark.Treeview.Heading", background=[("active", "#33333c")])
+        # ★ 二次修：把 field 层的 border 宽度归零（默认 1 → 会画一圈边框）
+        #   保留其余子结构不变，只改 field 的 border 与配色
+        try:
+            st.layout("Dark.Treeview", [
+                ("Dark.Treeview.field",
+                 {"sticky": "nswe", "border": "0",
+                  "children": [("Dark.Treeview.padding",
+                                {"sticky": "nswe",
+                                 "children": [("Dark.Treeview.treearea",
+                                               {"sticky": "nswe"})]})]})])
+        except Exception as _e:
+            _startup_log("表格 field 布局调整失败（不影响功能）：%s" % _e)
     except Exception as e:
         _startup_log("表格深色化失败：%s" % e)
 
@@ -311,21 +337,157 @@ def style_child_window(win, round_corners=True, tree=False):
             pass
 
 
-def enable_border_resize(win, min_w=240, min_h=80, edge=_RESIZE_EDGE):
-    """给无边框窗口恢复「四边/四角拖拽改大小」的能力。
+def virtual_screen(win=None):
+    """★ 2026-10-09 新增：取「所有显示器拼成的虚拟桌面」范围（支持多屏）。
+
+    ⚠️ 为什么需要它（用户 2026-10-09 报的 bug：主窗口拖不到副屏）：
+      Tk 的 `winfo_screenwidth()/screenheight()` **只返回主显示器**的尺寸；
+      而副屏可能排在主屏左边/上方（坐标为负），于是
+      拖动/拉伸的位置钳制写成 `max(-w+60, min(x, sw-60))` + `y>=0` 时，
+      窗口**只能在主屏范围内移动**，往左/往上挪不过去 → 永远上不了副屏。
+      实测：主屏 2560x1440 + 左侧竖屏 1080x1920（x 从 -1080 起）时，
+      旧逻辑把 (-900, 400) 钳成 (-340, 400)，明显拖不过去。
+
+    修法：改用 Win32 的虚拟桌面度量（会覆盖所有显示器，含负坐标）：
+      SM_XVIRTUALSCREEN=76  SM_YVIRTUALSCREEN=77
+      SM_CXVIRTUALSCREEN=78 SM_CYVIRTUALSCREEN=79
+    返回 (x0, y0, x1, y1) —— 整个虚拟桌面的左上/右下角，坐标系与窗口一致。
+    取不到就退回主屏范围（老行为，保证不炸）。
+    """
+    try:
+        import ctypes
+        u = ctypes.WinDLL("user32", use_last_error=True)
+        x0 = u.GetSystemMetrics(76)
+        y0 = u.GetSystemMetrics(77)
+        cx = u.GetSystemMetrics(78)
+        cy = u.GetSystemMetrics(79)
+        if cx > 0 and cy > 0:
+            return x0, y0, x0 + cx, y0 + cy
+    except Exception:
+        pass
+    try:
+        return 0, 0, win.winfo_screenwidth(), win.winfo_screenheight()
+    except Exception:
+        return 0, 0, 1920, 1080
+
+
+def clamp_to_desktop(x, y, w, h, win=None, keep_visible=60):
+    """★ 把窗口位置钳制到**整个虚拟桌面**内（多屏安全，允许负坐标）。
+
+    保证至少有 keep_visible 像素留在可见区域，不会整个丢到屏幕外找不回来。
+    返回 (x, y)。
+    """
+    try:
+        dx0, dy0, dx1, dy1 = virtual_screen(win)
+        x = max(dx0 - w + keep_visible, min(x, dx1 - keep_visible))
+        y = max(dy0, min(y, dy1 - 40))
+    except Exception:
+        pass
+    return x, y
+
+
+def keep_out_of_taskbar(win):
+    """★ 2026-10-09 修：让无边框浮窗**不出现在任务栏 / Alt-Tab 里**。
+
+    ⚠️ 为什么需要它（用户 2026-10-09 报的 bug：最小化到托盘再打开，
+       任务栏/悬停预览里就多出一个「缓存跟随监控 v1.3.0」窗口）：
+
+    实测根因（tmp/find_toolwin.py 逐步取证）：
+      Tk 给窗口设 `-alpha`（透明度）时会切到 `WS_EX_LAYERED` 模式，
+      **顺手把 `WS_EX_TOOLWINDOW` 覆盖掉了**：
+          ② overrideredirect(True)  → EX=0x00000080  TOOLWINDOW=True  ✅ 不进任务栏
+          ④ -alpha=0.90            → EX=0x00080008  TOOLWINDOW=False ❌ 进任务栏了
+      而 `WS_EX_TOOLWINDOW` 正是「不进任务栏、不出现在 Alt-Tab」的那个样式位
+      （`overrideredirect` 本来会给，被 alpha 一冲就没了）。
+
+    修法：设完 alpha / 建完窗之后，显式把这个样式位补回去。
+      用 SetWindowLongW(GWL_EXSTYLE, ...) + SetWindowPos(SWP_FRAMECHANGED) 让它立即生效。
+
+    ⚠️⚠️ 2026-10-09 二次修（exe 里失效的坑）：
+      exe（PyInstaller 打包）里 `win.frame()` 返回的 hwnd **不是**真正的那层 ——
+      实测 exe 版这样设完，目标窗口的 EXSTYLE 纹丝不动（还是 0x00080008）。
+      对策：**三个候选 hwnd 全部设一遍**（frame() / 顶层父窗 / winfo_id()），
+      哪个是真窗口就改哪个，一次搞定，不依赖对 Tk 内部结构的假设。
+    """
+    ok_any = False
+    hwnds = []
+    try:
+        import ctypes
+        from ctypes import wintypes
+        u = ctypes.WinDLL("user32", use_last_error=True)
+        # 候选 1：Tk 的 frame()（源码模式下是对的）
+        try:
+            hwnds.append(int(win.frame(), 16))
+        except Exception:
+            pass
+        # 候选 2：winfo_id() 的顶层父窗
+        try:
+            wid = win.winfo_id()
+            hwnds.append(wid)
+            p = u.GetParent(wid)
+            if p:
+                hwnds.append(p)
+                pp = u.GetParent(p)
+                if pp:
+                    hwnds.append(pp)
+        except Exception:
+            pass
+        # 候选 3：frame() 的父窗
+        try:
+            p2 = u.GetParent(int(win.frame(), 16))
+            if p2:
+                hwnds.append(p2)
+        except Exception:
+            pass
+
+        GWL_EXSTYLE = -20
+        WS_EX_TOOLWINDOW = 0x00000080
+        WS_EX_APPWINDOW = 0x00040000
+        done = set()
+        for h in hwnds:
+            if not h or h in done:
+                continue
+            done.add(h)
+            try:
+                ex = u.GetWindowLongW(h, GWL_EXSTYLE) & 0xFFFFFFFF
+                want = (ex | WS_EX_TOOLWINDOW) & ~WS_EX_APPWINDOW
+                if want != ex:
+                    u.SetWindowLongW(h, GWL_EXSTYLE, want)
+                    u.SetWindowPos(wintypes.HWND(h), None, 0, 0, 0, 0,
+                                   0x0002 | 0x0001 | 0x0004 | 0x0010 | 0x0020)
+                after = u.GetWindowLongW(h, GWL_EXSTYLE) & 0xFFFFFFFF
+                if after & WS_EX_TOOLWINDOW:
+                    ok_any = True
+            except Exception:
+                continue
+        return ok_any
+    except Exception as e:
+        try:
+            _startup_log("保持不进任务栏失败（不影响主要功能）：%s" % e)
+        except Exception:
+            pass
+        return False
+
+
+def enable_border_resize(win, min_w=240, min_h=80, edge=_CORNER_EDGE):
+    """给无边框窗口恢复「**四角**拖拽改大小」的能力。
+
+    ★ 2026-10-09 用户要求（第三次调整）：**只要四角能拉伸，四条边不要**。
+      原因：原先四边各留 6px 热区，整圈边框都是「拉伸感应区」，
+      而浮窗很小、内容区紧贴边缘 → 用户想拖动窗口时经常按到边上变成拉伸，误触频繁。
+      现在四条边 = 纯拖动区，只有四个角（默认 14px 见方）能拉伸。
 
     返回给调用方的字典，附带 bind_tree() 用于把事件绑到所有子控件
     （Tk 的 Motion 事件发给指针所在控件，不绑子控件就会出现"某些区域拉不动"）。
     """
     st = {"mode": None, "x": 0, "y": 0, "px": 0, "py": 0, "w": 0, "h": 0}
     CURSORS = {
-        "n": "sb_v_double_arrow", "s": "sb_v_double_arrow",
-        "e": "sb_h_double_arrow", "w": "sb_h_double_arrow",
         "ne": "size_ne_sw", "sw": "size_ne_sw",
         "nw": "size_nw_se", "se": "size_nw_se",
     }
 
     def _which(ev):
+        """★ 只返回四个角；四条边一律返回 None（= 交给拖动逻辑）。"""
         try:
             w = win.winfo_width()
             h = win.winfo_height()
@@ -333,6 +495,8 @@ def enable_border_resize(win, min_w=240, min_h=80, edge=_RESIZE_EDGE):
             return None
         x, y = ev.x, ev.y
         e = edge
+        # 角热区要够大才好按（默认 14px），但不能大到吃掉小窗口
+        e = max(8, min(e, w // 3, h // 3))
         west, east = x <= e, x >= w - e
         north, south = y <= e, y >= h - e
         if north and west:
@@ -343,15 +507,7 @@ def enable_border_resize(win, min_w=240, min_h=80, edge=_RESIZE_EDGE):
             return "sw"
         if south and east:
             return "se"
-        if north:
-            return "n"
-        if south:
-            return "s"
-        if west:
-            return "w"
-        if east:
-            return "e"
-        return None
+        return None               # ← 四条边不再拉伸
 
     def _press(ev):
         m = _which(ev)
@@ -372,10 +528,10 @@ def enable_border_resize(win, min_w=240, min_h=80, edge=_RESIZE_EDGE):
             return
         dx, dy = ev.x_root - st["x"], ev.y_root - st["y"]
         x, y, w, h = st["px"], st["py"], st["w"], st["h"]
-        try:
-            sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
-        except Exception:
-            sw, sh = 1920, 1080
+        # ★ 2026-10-09 修：用「整个虚拟桌面」的尺寸来钳制（原来只拿主屏，
+        #   副屏上的窗口一拉伸就被拽回主屏范围）。虚拟桌面见 virtual_screen()。
+        _dx0, _dy0, _dx1, _dy1 = virtual_screen(win)
+        sw, sh = _dx1 - _dx0, _dy1 - _dy0
         if "e" in m:
             w = max(min_w, st["w"] + dx)
         if "s" in m:
@@ -391,10 +547,10 @@ def enable_border_resize(win, min_w=240, min_h=80, edge=_RESIZE_EDGE):
         #      整个位移量被反复叠加，越拉越偏。
         #   ② 尺寸也要钳制：原来只夹位置，尺寸能涨到比屏幕还大（实测 2420x1486
         #      在 2560x1440 屏上），视觉上就是"窗口跑没了"。
+        #   ③ 再修（多屏）：钳制范围改用整个虚拟桌面，副屏上拉伸不会被拽回主屏。
         w = min(w, sw)
         h = min(h, sh)
-        x = max(-w + 60, min(x, sw - 60))
-        y = max(0, min(y, sh - 40))
+        x, y = clamp_to_desktop(x, y, w, h, win)
         win.geometry("%dx%d+%d+%d" % (w, h, x, y))
 
     def _release(_ev=None):
@@ -551,15 +707,15 @@ class DarkMenu:
         pop.update_idletasks()
         w = self.width
         h = pop.winfo_reqheight()
-        # 屏幕边界处理
+        # 屏幕边界处理（★ 2026-10-09 多屏：改用虚拟桌面，副屏上菜单不再跑到主屏）
         try:
-            sw = pop.winfo_screenwidth()
-            sh = pop.winfo_screenheight()
+            dx0, dy0, dx1, dy1 = virtual_screen(pop)
+            sw, sh = dx1, dy1
             x, y = x_root, y_root
             if x + w > sw:
-                x = max(0, sw - w - 4)
+                x = max(dx0, sw - w - 4)
             if y + h > sh:
-                y = max(0, sh - h - 4)
+                y = max(dy0, sh - h - 4)
             pop.geometry("%dx%d+%d+%d" % (w, h, x, y))
         except Exception:
             pop.geometry("%dx%d" % (w, h))
@@ -634,8 +790,9 @@ class DarkMenu:
             lb.bind("<Leave>", self._hl_off, add="+")
         pop.update_idletasks()
         try:
-            sw = pop.winfo_screenwidth()
-            sh = pop.winfo_screenheight()
+            # ★ 2026-10-09 多屏：子菜单也用虚拟桌面边界
+            dx0, dy0, dx1, dy1 = virtual_screen(pop)
+            sw, sh = dx1, dy1
             hx = host_label.winfo_rootx()
             hy = host_label.winfo_rooty()
             w = self.width + 20
@@ -643,9 +800,9 @@ class DarkMenu:
             x = hx + host_label.winfo_width() - 6
             y = hy
             if x + w > sw:
-                x = max(0, hx - w + 6)
+                x = max(dx0, hx - w + 6)
             if y + h > sh:
-                y = max(0, sh - h - 4)
+                y = max(dy0, sh - h - 4)
             pop.geometry("%dx%d+%d+%d" % (w, h, x, y))
         except Exception:
             pass
@@ -732,7 +889,7 @@ def today_site_total(day=None):
 
 
 APP_NAME = "HermesCacheMonitor"
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.3.1"
 
 # 数据目录分裂检测结果（由 _appdata_dir() 填充）：非空 = 发现 MSIX 虚拟化影子目录
 _DATA_SPLIT = ""
@@ -1624,8 +1781,19 @@ def fmt_vol(n):
 
 
 def fmt_money(v, cur="¥"):
+    """金额格式化。
+
+    ★ 2026-10-09 修：价格表里 `cur` 可能是 "CNY"（「从中转站实扣同步价格」
+      自动写入的就是这个），直接输出会显示成 `CNY0.0035` 这种半洋半土的写法。
+      这里统一把常见的币种代码映射成符号，显示才干净。
+    """
     if v is None:
         return "--"
+    # 币种代码 → 符号（用户看到的应该是符号，不是代码）
+    _SYM = {"CNY": "¥", "RMB": "¥", "元": "¥", "USD": "$", "US$": "$",
+            "EUR": "€", "JPY": "¥", "": "¥", None: "¥"}
+    cur = _SYM.get((cur or "").strip().upper() if isinstance(cur, str) else cur,
+                   cur or "¥")
     if abs(v) < 1:
         return "%s%.4f" % (cur, v)
     if abs(v) < 10:
@@ -3883,6 +4051,47 @@ class Monitor:
             entry, d["inp"], d["cr"], d["out"], now_hm,
             calls=calls_for(d.get("site"), d.get("model"), fallback=d.get("calls")))
         d["price_entry"] = entry
+
+        # ★ 2026-10-09 新增：会话用过多个「站×模型」时，逐条计价再汇总。
+        #   ⚠️ 必须放在上面那行**之后** —— 上面是「单组合」的老口径（价格窗
+        #   回填、entry_of 等仍要用它），这里是「多组合」的权威口径，覆盖显示值。
+        #   触发条件：session_model_usage 里不止一个「站|模型」分组。
+        #   单组合时不启用，保证绝大多数会话的行为一字不变（零回归风险）。
+        try:
+            d["multi"] = _multi_priced(sid, d, now_hm, prices=self.prices)
+        except Exception as _e:
+            d["multi"] = None
+            _startup_log("多站多模型汇总失败（已退回单组合口径）：%s" % _e)
+        _mu = d.get("multi")
+        if _mu and len(_mu.get("pairs") or []) > 1:
+            # 用真实用量覆盖「站/模型」显示值（原来错用 sessions 主记录那一行）
+            if _mu["sites"]:
+                d["sites_real"] = _mu["sites"]
+            if _mu["models"]:
+                d["models_real"] = _mu["models"]
+            # 站/模型显示改为「调用最多的那个」= pairs 已按次数降序
+            _top = _mu["pairs"][0]
+            d["site"] = _top["site"]
+            d["model"] = _top["model"]
+            # 计价：只要有任意一条匹配到价，就用逐条汇总的结果替换
+            if _mu["matched"]:
+                _agg = dict(_mu)
+                _agg["multi_mode"] = True
+                d["priced"] = _agg
+                # 价格窗回填用：主组合的价格条目
+                d["price_entry"] = _top.get("entry")
+        elif _mu and len(_mu.get("pairs") or []) == 1:
+            # 单组合但主记录与实际不一致时，也顺手纠正（如 localhost 那类）
+            _only = _mu["pairs"][0]
+            if _only["site"] != d.get("site") or _only["model"] != d.get("model"):
+                d["site"] = _only["site"]
+                d["model"] = _only["model"]
+                if _only.get("entry"):
+                    d["price_entry"] = _only["entry"]
+                _agg = dict(_mu)
+                _agg["multi_mode"] = True
+                d["priced"] = _agg if _only.get("cost") is not None else d["priced"]
+
         d["children"] = self._children_cost(sid, now_hm)
         calib = self.calib_mgr.get_session_calib(sid) if hasattr(self, "calib_mgr") else None
         d["calib"] = calib
@@ -4835,6 +5044,182 @@ class CostLedger:
             k["hit"] += hit or 0
             k["out"] += o or 0
         return out
+
+def _multi_priced(sid, d, now_hm, day=None, prices=None):
+    """★ 2026-10-09 新增（模块级）：一个会话用过**多个「站×模型」**时，逐条匹配价格再汇总。
+
+    ⚠️ 为什么必须加（用户 2026-10-09 报的 bug）：
+      `sessions` 表每个会话只有**一行**主记录，只记得**最后一次**的
+      billing_base_url / model。原实现拿这一对去匹配价格，于是：
+        会话 20261008_200019 实际用了
+          localhost:8787 × gemini-3.8-flash-high（76 次）
+          api9.dshapi.icu × deepseek-v4.1-flash（6 次）
+        但主记录停在最后一对 = api9.dshapi.icu × gemini-3.8-flash-high
+        → 匹配到的价格条目完全不对，站和模型张冠李戴
+          （实测 `--sid` 输出 site=api.dshapi.icu / model=gemini-3.8-flash-high
+            / price=未配置，而价格表里 `localhost|gemini-3.8-flash-high` 明明有）。
+
+    正确做法：以 `session_model_usage` 的真实分组为准（一行 = 一个「站×模型」），
+      每行各自匹配自己的价格、各自算成本，最后把金额相加。
+      站名与模型名也一并按真实用量汇总返回，供界面显示。
+
+    ⚠️ 调用方在 Monitor 里，所以本函数做成**模块级**（早先版本误挂到 CostLedger
+      下，日志实测报 `'Monitor' object has no attribute '_multi_priced'`）。
+
+    *prices* = PriceBook 实例（由调用方传，避免这里再 new 一个）。
+
+    返回 dict（无数据时返回 None）：
+      {pairs/sites/models/matched/unmatched/total_cost/saved/cur/free/per_call/
+       cost/calls/list_cost/period/ratio/seg_from}
+      —— 后几个字段是为了让渲染层能直接当 priced 字典用。
+    """
+    pairs = []
+    try:
+        rows = db_query(
+            "SELECT billing_base_url, model, "
+            "COALESCE(SUM(api_call_count),0), COALESCE(SUM(input_tokens),0), "
+            "COALESCE(SUM(cache_read_tokens),0), COALESCE(SUM(output_tokens),0) "
+            "FROM session_model_usage WHERE session_id=? "
+            "GROUP BY billing_base_url, model "
+            "ORDER BY 3 DESC", (sid,))
+    except Exception:
+        rows = []
+
+    if not rows:
+        return None
+
+    total_cost = 0.0
+    total_saved = 0.0
+    cur = "¥"
+    n_matched = 0
+    n_unmatched = 0
+    all_free = True
+    all_per_call = True
+    any_per_call = False
+    sites, models = [], []
+
+    for burl, model, calls, inp, hit, out in rows:
+        try:
+            site = canon_host(urlparse(burl).hostname or "?")
+        except Exception:
+            site = canon_host(burl or "?")
+        model_n = canon_model(model or "?")
+        if site and site != "?" and site not in sites:
+            sites.append(site)
+        if model_n and model_n != "?" and model_n not in models:
+            models.append(model_n)
+
+        calls = int(calls or 0)
+        inp, hit, out = int(inp or 0), int(hit or 0), int(out or 0)
+
+        entry = prices.match(site, model_n, day) if prices else None
+        c = compute_cost(entry, inp, hit, out, now_hm, day=day,
+                         calls=calls_for(site, model_n, fallback=calls))
+        rec = {"site": site, "model": model_n, "calls": calls,
+               "in": inp, "hit": hit, "out": out,
+               "entry": entry, "cost": None, "free": False,
+               "per_call": None, "saved": 0.0, "cur": cur}
+        if c is None:
+            n_unmatched += 1
+            all_free = False
+            all_per_call = False
+        else:
+            n_matched += 1
+            cur = c.get("cur") or cur
+            rec["cost"] = c.get("cost")
+            rec["saved"] = c.get("saved") or 0.0
+            rec["free"] = bool(c.get("free"))
+            rec["per_call"] = c.get("per_call")
+            rec["cur"] = cur
+            if not c.get("free"):
+                all_free = False
+            if c.get("per_call"):
+                any_per_call = True
+            else:
+                all_per_call = False
+            total_cost += (c.get("cost") or 0.0)
+            total_saved += (c.get("saved") or 0.0)
+        pairs.append(rec)
+
+    if not n_matched:
+        all_per_call = False
+
+    return {"pairs": pairs, "sites": sites, "models": models,
+            "matched": n_matched, "unmatched": n_unmatched,
+            "total_cost": total_cost, "saved": total_saved, "cur": cur,
+            "free": bool(all_free and n_matched),
+            "per_call": bool(all_per_call and n_matched),
+            "any_per_call": any_per_call,
+            # 兼容原 priced 字典的字段名，渲染层可直接读
+            "cost": total_cost,
+            "calls": sum(p["calls"] for p in pairs),
+            "list_cost": total_cost,
+            "period": None, "ratio": 1.0, "seg_from": ""}
+
+
+class CostLedger:
+    """日账本：每天结算一次各站×模型的消费（水位差值法）+ 价格冻结。
+
+    水位差值 = 今日 DB 累计 − 上次结算时的 DB 累计。
+    因为差值天然规避"跨天会话"的归属问题，所以比按 last_seen 切分更准。
+    结算时把「当时算出的成本（含当时倍率）」一起写死 → 日后改价不污染历史。
+    """
+
+    def __init__(self, path=None, prices=None):
+        self.path = path or LEDGER_PATH
+        self.prices = prices
+        self.data = {"days": {}, "approx": [], "bills": [],
+                     "watermark": {"ts": None, "day": None, "keys": {}}}
+        # 非空 = 「文件在、但读不了」→ 禁止写盘（否则 60 秒内 maybe_settle 就会覆盖掉全部历史）
+        self._load_error = ""
+        self.load()
+
+    # ---------- 存取 ----------
+    def load(self):
+        """读账本。
+
+        ⚠ 与 PriceBook 同理：文件不存在 ≠ 读失败。
+        读失败时必须保留内存数据并禁止写盘 —— 否则 tick 每 60 秒调一次 maybe_settle，
+        会立刻用空账本覆盖掉全部历史账目（实测复现）。
+        """
+        self._load_error = ""
+        try:
+            with open(self.path, "r", encoding="utf-8-sig") as f:
+                d = json.load(f)
+        except FileNotFoundError:
+            pass                        # 首次运行 → 空账本，正常
+        except OSError as ex:
+            self._load_error = "账本被占用：%s" % ex
+            return
+        except ValueError as ex:
+            self._load_error = "账本 JSON 损坏：%s" % ex
+            return
+        else:
+            if isinstance(d, dict) and "days" in d:
+                self.data = d
+        self.data.setdefault("days", {})
+        self.data.setdefault("approx", [])
+        self.data.setdefault("bills", [])
+        self.data.setdefault("watermark", {"ts": None, "day": None, "keys": {}})
+
+    def save(self):
+        """原子写账本。读失败时拒绝写盘（返回 False），避免覆盖能救回的数据。"""
+        if self._load_error:
+            _startup_log("账本保存被拒（%s）" % self._load_error)
+            return False
+        if not self.path:
+            # 路径解析失败（如环境变量缺失导致的异常启动）→ 别去 replace("") 报 WinError 3
+            _startup_log("账本保存被拒：数据目录未解析出来")
+            return False
+        try:
+            tmp = self.path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self.data, f, ensure_ascii=False, indent=1)
+            os.replace(tmp, self.path)
+            return True
+        except Exception as ex:
+            _startup_log("账本保存失败：%s" % ex)
+            return False
 
     def _price_cost(self, host, model, d, day=None, now_hm=None):
         """按 *day* 生效的价格段算成本。返回 (cost, ratio, seg_from)。"""
@@ -6829,6 +7214,17 @@ class App:
         self.mini_h = int(cfg.get("mini_h", 104))
         # 兼容旧字段：win_w 作为「当前模式的宽」的别名（其他代码仍在读它）
         self.win_w = self.mini_w if self.mini_mode else self.full_w
+        # ★ 2026-10-09 多屏：记住窗口位置（可为负 = 副屏在主屏左边/上方）
+        #   None = 没存过 → 首次运行走「主屏右上角」的默认位置
+        self.pos_x = cfg.get("pos_x")
+        self.pos_y = cfg.get("pos_y")
+        try:
+            self.pos_x = None if self.pos_x is None else int(self.pos_x)
+            self.pos_y = None if self.pos_y is None else int(self.pos_y)
+        except (TypeError, ValueError):
+            self.pos_x = self.pos_y = None
+        self.cur_x = self.pos_x
+        self.cur_y = self.pos_y
 
         self.root = tk.Tk()
         self.root.title("缓存跟随监控 v%s" % APP_VERSION)
@@ -6843,13 +7239,38 @@ class App:
             self.root.overrideredirect(True)
         except Exception as e:
             _startup_log("去掉系统标题栏失败（不影响功能）：%s" % e)
-        sw = self.root.winfo_screenwidth()
+        _dx0, _dy0, _dx1, _dy1 = virtual_screen(self.root)
         self.root.attributes("-topmost", True)
         self.root.configure(bg=BG)
         try:
             self.root.attributes("-alpha", self.alpha)
         except Exception:
             pass
+        # ★ 2026-10-09 修：上面设 -alpha 会把 WS_EX_TOOLWINDOW 冲掉 → 窗口会进任务栏。
+        #   这里补回来（详见 keep_out_of_taskbar 的注释与实测取证）。
+        #   ⚠️ 为什么用**轮询**而不是定时几次（实测教训）：
+        #      exe 版首次启动要 **8.4 秒**才把窗口显示出来（源码版只要 0.3 秒），
+        #      固定延时（30/300/1000/2500ms）全都跑在窗口出现**之前**，等于没补。
+        #      改成：从 0.2 秒起每 0.4 秒补一次、连补 40 次（≈16 秒），
+        #      只要窗口在就不受启动快慢影响。幂等操作，重复调用无副作用。
+        self._keep_tb_tries = 0
+
+        def _keep_tb_loop():
+            try:
+                keep_out_of_taskbar(self.root)
+            except Exception:
+                pass
+            self._keep_tb_tries += 1
+            # 前 8 次（≈3.2 秒）密集补 —— 覆盖 alpha 设置与窗口映射
+            # 之后拉长到 1.5 秒一次，直到 40 次用完（≈45 秒），覆盖冷启动慢的情况
+            if self._keep_tb_tries < 40:
+                delay = 400 if self._keep_tb_tries < 8 else 1500
+                try:
+                    self.root.after(delay, _keep_tb_loop)
+                except Exception:
+                    pass
+
+        self.root.after(200, _keep_tb_loop)
 
         # === 完整模式容器 ===
         self.frm_full = tk.Frame(self.root, bg=BG)
@@ -6986,14 +7407,23 @@ class App:
         #   ★ 2026-10-09 修正：原来这里写死 max(104,…)/max(280,…)，与拉伸下限
         #   （min_w=240/min_h=80）不一致；统一走 _MIN_* 常量，避免"手动能缩到 240、
         #   一切换就被抬回去"的割裂感。
+        #   ★ 2026-10-09 多屏修正：位置改走 clamp_to_desktop（虚拟桌面），
+        #   并支持恢复上次位置（pos_x/pos_y）—— 原来每次都强制回到主屏右上角，
+        #   拖到副屏后一重启就"跑回主屏"，看着像"上不了副屏"。
+        _dx0, _dy0, _dx1, _dy1 = virtual_screen(self.root)
+        _pw = self.win_w
+        _ph = (max(_MIN_MINI_H, self.mini_h) if self.mini_mode
+               else max(_MIN_FULL_H, self.full_h))
+        _px, _py = self.pos_x, self.pos_y
+        if _px is None or _py is None:                 # 首次运行 → 主屏右上角
+            _px, _py = _dx1 - _pw - 20, _dy0 + 60
+        _px, _py = clamp_to_desktop(_px, _py, _pw, _ph, self.root)
+        self.cur_x, self.cur_y = _px, _py
         if self.mini_mode:
             self.frm_mini.pack(fill="both", expand=True)
-            self.root.geometry("%dx%d+%d+60" % (self.win_w, max(_MIN_MINI_H, self.mini_h),
-                                                sw - self.win_w - 20))
         else:
             self.frm_full.pack(fill="both", expand=True)
-            self.root.geometry("%dx%d+%d+60" % (self.win_w, max(_MIN_FULL_H, self.full_h),
-                                                sw - self.win_w - 20))
+        self.root.geometry("%dx%d+%d+%d" % (_pw, _ph, _px, _py))
 
         # 监听窗口拖拽尺寸调整（自适应换行并记忆）
         self.root.bind("<Configure>", self.on_window_resize)
@@ -7013,9 +7443,11 @@ class App:
                   self.lbl_today, self.mini_lbl_today):
             w.bind("<Double-Button-1>", _on_dbl)
 
-        # ★ 2026-10-09 无边框拖动 + 四边拉伸（见 bind_window_drag / enable_border_resize 注释）
+        # ★ 2026-10-09 无边框拖动 + **四角**拉伸（见 bind_window_drag / enable_border_resize）
         #   拖动：绑在 root 上（Tk 的 Motion 事件发给指针所在控件，只绑 Label 会"只有文字能拖"）
-        #   拉伸：四条边+四角 6px 热区，事件绑到所有子控件
+        #   拉伸：★ 用户第三次调整 —— 只要四个角（14px），四条边改成纯拖动区。
+        #         原先四边各留 6px 热区，整圈边框都是拉伸感应区，
+        #         浮窗小、内容紧贴边缘 → 想拖动时经常按到边上变成拉伸，误触频繁。
         try:
             bind_window_drag(self.root, [self.frm_full, self.frm_mini,
                                          self.lbl_title, self.lbl_detail,
@@ -7125,14 +7557,21 @@ class App:
             _startup_log("托盘初始化失败：%s" % e)
 
     def on_close_to_tray(self):
-        """点击右上角 ✕ 时隐藏到隐藏图标区，不退出程序。"""
+        """点「🗕 最小化到托盘」→ 隐藏到隐藏图标区，不退出程序。"""
         self.root.withdraw()
 
     def show_from_tray(self):
-        """从托盘恢复窗口显示并置顶。"""
+        """从托盘恢复窗口显示并置顶。
+
+        ★ 2026-10-09 修：deiconify/lift 之后重新补一次「不进任务栏」样式 ——
+          用户报「最小化到托盘再打开，任务栏里就多出一个窗口」。
+          根因是 Tk 设 -alpha 时冲掉了 WS_EX_TOOLWINDOW（见 keep_out_of_taskbar）。
+          这里再补一次，确保任何路径唤回后都不会混进任务栏。
+        """
         self.root.deiconify()
         self.root.lift()
         self.root.attributes("-topmost", True)
+        keep_out_of_taskbar(self.root)
 
     def exit_app(self):
         """彻底退出程序（清理托盘与后台守护）。"""
@@ -7170,6 +7609,9 @@ class App:
             self.root.attributes("-alpha", self.alpha)
         except Exception:
             pass
+        # ★ 2026-10-09：Tk 设 -alpha 会把 WS_EX_TOOLWINDOW 冲掉 → 窗口进任务栏。
+        #   每次改完透明度都补回来（用户实测：改透明度后任务栏多出窗口）。
+        keep_out_of_taskbar(self.root)
         # 拖动过程每帧都写盘太浪费 → 防抖保存（松手 0.6 秒后落盘一次）
         try:
             if getattr(self, "_alpha_save_job", None):
@@ -7185,16 +7627,22 @@ class App:
         self.set_alpha(float(pct) / 100.0, quiet=True)
 
     def _save_alpha(self):
+        """防抖落盘：透明度 + 窗口位置（★ 2026-10-09 多屏后一并存位置）。
+
+        位置含副屏的负坐标，必须原样保存，否则重启就"跑回主屏"。
+        """
         self._alpha_save_job = None
         try:
             cfg = load_config()
             cfg["alpha"] = self.alpha
+            if self.pos_x is not None and self.pos_y is not None:
+                cfg["pos_x"], cfg["pos_y"] = int(self.pos_x), int(self.pos_y)
             save_config(cfg)
         except Exception:
             pass
 
     def on_window_resize(self, ev):
-        """用户拖拽改变窗口大小时：记忆尺寸并动态调整文字折行宽度。"""
+        """用户拖拽改变窗口大小/位置时：记忆尺寸与位置，并动态调整文字折行宽度。"""
         if ev.widget != self.root:
             return
         # ★ 2026-10-09 修正（用户实测：「宽度还是继承」）：
@@ -7208,6 +7656,17 @@ class App:
         h = ev.height
         if w < 100 or h < 30:
             return
+
+        # ★ 2026-10-09 多屏：位置也一并记下来（拖到副屏后要能留住，坐标可为负）
+        try:
+            self.pos_x, self.pos_y = self.root.winfo_x(), self.root.winfo_y()
+            self.cur_x, self.cur_y = self.pos_x, self.pos_y
+            # 拖动过程每帧都写盘太浪费 → 复用透明度的防抖机制（松手 0.6 秒后落盘一次）
+            if getattr(self, "_alpha_save_job", None):
+                self.root.after_cancel(self._alpha_save_job)
+            self._alpha_save_job = self.root.after(600, self._save_alpha)
+        except Exception:
+            pass
 
         # ★ 2026-10-09：完整/精简各自记宽高（切换互不继承）
         if self.mini_mode:
@@ -7246,8 +7705,11 @@ class App:
             cur_x = self.root.winfo_x()
             cur_y = self.root.winfo_y()
         except Exception:
-            cur_x = self.root.winfo_screenwidth() - self.win_w - 20
-            cur_y = 60
+            cur_x, cur_y = (self.cur_x, self.cur_y)
+            if cur_x is None or cur_y is None:
+                cur_x, cur_y = clamp_to_desktop(0, 60, self.win_w, 100, self.root)
+        # ★ 2026-10-09 多屏：记住当前位置（切换模式时位置不变，但要存下来）
+        self.cur_x, self.cur_y = cur_x, cur_y
 
         cfg = load_config()
         cfg["mini_mode"] = self.mini_mode
@@ -7256,6 +7718,8 @@ class App:
         cfg["mini_w"] = self.mini_w
         cfg["mini_h"] = self.mini_h
         cfg["win_w"] = self.win_w        # 兼容旧字段
+        # ★ 2026-10-09 多屏：位置一并记住（副屏坐标为负，要原样存）
+        cfg["pos_x"], cfg["pos_y"] = cur_x, cur_y
         save_config(cfg)
 
         # ★ 2026-10-09：切到哪个模式就用哪个模式**自己的**宽和高（不再继承宽度）
@@ -7267,14 +7731,17 @@ class App:
                 self.frm_mini.pack(fill="both", expand=True)
                 target_w = max(_MIN_W, self.mini_w)
                 target_h = max(_MIN_MINI_H, self.mini_h)
-                self.root.geometry("%dx%d+%d+%d" % (target_w, target_h, cur_x, cur_y))
             else:
                 self.frm_mini.pack_forget()
                 self.frm_full.pack(fill="both", expand=True)
                 target_w = max(_MIN_W, self.full_w)
                 target_h = max(_MIN_FULL_H, self.full_h)
-                self.root.geometry("%dx%d+%d+%d" % (target_w, target_h, cur_x, cur_y))
+            # ★ 2026-10-09 多屏：切模式时位置也走虚拟桌面钳制
+            #   （原来直接透传 cur_x/cur_y，副屏上会被旧的主屏钳制逻辑挤回去）
+            cur_x, cur_y = clamp_to_desktop(cur_x, cur_y, target_w, target_h, self.root)
+            self.root.geometry("%dx%d+%d+%d" % (target_w, target_h, cur_x, cur_y))
             self.win_w = target_w
+            self.pos_x, self.pos_y = cur_x, cur_y
         finally:
             # 解锁放到 geometry 生效之后（约 250ms），期间所有 Configure 都丢弃
             self.root.after(250, lambda: setattr(self, "_resize_lock", False))
@@ -7711,8 +8178,34 @@ class App:
             else:
                 site_items.append("[● %s]" % s_short)
         site_str = "  ".join(site_items) if site_items else d["site"]
-        if len(cur_models) > 1:
-            site_str += "\n模型：" + "、".join(cur_models)
+        # ★ 2026-10-09：站/模型列表优先用「真实用量」的顺序（session_model_usage
+        #   按调用次数降序），不再让 sessions 主记录那一行排第一个 —— 主记录只记得
+        #   最后一次用的组合，排它第一会误导（实测 20261008_200019 主记录是
+        #   api9×gemini，但实际 76 次都用的是 localhost×gemini）。
+        _sites_show = d.get("sites_real") or cur_sites
+        _models_show = d.get("models_real") or cur_models
+        if len(_sites_show) > 1 or len(_models_show) > 1:
+            _parts = []
+            if _sites_show:
+                _parts.append("站：" + "、".join(_sites_show))
+            if _models_show:
+                _parts.append("模型：" + "、".join(_models_show))
+            if _parts:
+                site_str += "\n" + " ｜ ".join(_parts)
+
+        # ★ 2026-10-09：多组合逐条计价时，给一行明细（哪个组合花了多少）
+        _mu = d.get("multi") or {}
+        _pairs = _mu.get("pairs") or []
+        if _mu.get("multi_mode") and len(_pairs) > 1:
+            _lines = []
+            for _p in _pairs:
+                _c = ("免费" if _p.get("free") else
+                      (fmt_money(_p["cost"], _p.get("cur")) if _p.get("cost") is not None
+                       else "未配价"))
+                _lines.append("%s×%s %s" % (_p["site"], _p["model"], _c))
+            _unp = _mu.get("unmatched") or 0
+            _tail = "（%d 条未配价）" % _unp if _unp else ""
+            site_str += "\n明细：" + " ｜ ".join(_lines) + _tail
 
         # 「缓存明细缺失」的提示（2026-10-03）：补齐了几次 / 几次没数据可补
         _fx = d.get("cache_fix") or {}

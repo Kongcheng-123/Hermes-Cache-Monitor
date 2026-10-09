@@ -82,9 +82,9 @@ def main_domain(u):
     newmirror.example.com → example.com
     localhost / IP      → 原样返回（不折叠）
 
-    ★ 2026-10-09 新增：用户换中转站入口（如 api9.example.com）后，Hermes 记录的
+    ★ 2026-10-09 新增：用户换中转站入口（api9.dshapi.icu）后，Hermes 记录的
       billing_provider 会退化成裸 `custom`（没有 `:后缀`），而 sites.json 里
-      登记的是 `custom:your-provider` → provider 映射不上、bases 里又没这个新入口，
+      登记的是 `custom:your-provider` → provider 映射不上、bases 里又没 api9，
       → 该会话之后的流水全部归集不上（实测 1627 条 match_kind=none）。
       对策：归集时**以 API 地址的主域名为主**（域名是硬事实，不随名字变），
       provider 名只作辅助。同一主域名下挂多个站时不猜（返回全部候选）。

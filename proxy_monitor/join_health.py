@@ -3,9 +3,9 @@
 
 ## 为什么有这个东西
 
-用户换中转站入口地址后（例：从 `api2.example.com` 换到 `api9.example.com`），Hermes 记录的
+用户换中转站入口地址后（例：dshapi 从 api2 换到 api9），Hermes 记录的
 `billing_provider` 会**退化成裸 `custom`**，而站点配置里登记的是
-`custom:your-provider` → provider 映射不上、bases 里又没这个新入口
+`custom:your-provider` → provider 映射不上、bases 里又没 api9
 → 该会话之后的流水**全部归集不上**，面板数字一直停在换站那一刻。
 
 实测证据（2026-10-09）：换站后 1627 条流水 match_kind=none，
